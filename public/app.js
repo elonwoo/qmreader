@@ -24,6 +24,25 @@ function readStoredNumber(key) {
 }
 
 const CATEGORY_LABELS = { article: '文章', news: '资讯', podcast: '播客', community: '社区' };
+const collapsedGroups = new Set(readJson('qm_collapsed_groups', '[]'));
+function setGroupCollapsed(key, collapsed) {
+  if (collapsed) collapsedGroups.add(key); else collapsedGroups.delete(key);
+  storage.setItem('qm_collapsed_groups', JSON.stringify([...collapsedGroups]));
+}
+function groupToggleButton(key, collapsed) {
+  const caret = document.createElement('button');
+  caret.type = 'button';
+  caret.className = 'group-toggle';
+  caret.setAttribute('aria-label', collapsed ? '展开' : '收起');
+  caret.setAttribute('aria-expanded', String(!collapsed));
+  setElementIcon(caret, 'chevron-down');
+  caret.onclick = event => {
+    event.stopPropagation();
+    setGroupCollapsed(key, !collapsed);
+    renderSidebar();
+  };
+  return caret;
+}
 const storedWechatSources = readJson('qm_wechat_sources', '[]');
 const storedPodcastSources = readJson('qm_podcast_sources', '[]');
 const READER_TABS = ['original', 'rewrite', 'translation'];
@@ -2219,6 +2238,9 @@ function renderSidebar() {
     label.style.cursor = 'pointer';
     label.title = `查看全部${CATEGORY_LABELS[cat]}`;
     label.onclick = () => selectCategory(cat);
+    const collapsed = collapsedGroups.has(cat);
+    label.classList.toggle('collapsed', collapsed);
+    label.prepend(groupToggleButton(cat, collapsed));
     if (cat === 'podcast') {
       label.classList.add('wechat-group-label');
       const add = document.createElement('button');
@@ -2231,6 +2253,7 @@ function renderSidebar() {
       label.appendChild(add);
     }
     wrap.appendChild(label);
+    if (collapsed) continue;
 
     for (const s of list) {
       const btn = document.createElement('button');
@@ -2257,8 +2280,12 @@ function renderSidebar() {
     setElementIcon(add, 'plus');
     add.onclick = openWechatCatalog;
     label.appendChild(add);
+    const wechatCollapsed = collapsedGroups.has('wechat');
+    label.classList.toggle('collapsed', wechatCollapsed);
+    label.prepend(groupToggleButton('wechat', wechatCollapsed));
     wrap.appendChild(label);
-    for (const s of wechatSources.filter(source => state.optInSources.has(source.id))) {
+    const visibleWechat = wechatCollapsed ? [] : wechatSources.filter(source => state.optInSources.has(source.id));
+    for (const s of visibleWechat) {
       const btn = document.createElement('button');
       btn.className = 'feed-item' + (state.filterSource === s.id ? ' active' : '');
       const unread = unreadCountFor(entry => entryBelongsToSource(entry, s.id));

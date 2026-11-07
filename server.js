@@ -4067,7 +4067,7 @@ const refreshTitles = require('./lib/title-jobs').createTitleJobs({
     const source = fetcher.getSourceById(entry.sourceId);
     return source && fetcher.isEnabled(source) && (entry.titleZh || deepseek.needsEntryTitleTranslation(entry));
   },
-  translate: entries => deepseek.translateTitleBatch(entries, { author: 'system', model: 'deepseek-flash' }),
+  translate: entries => deepseek.translateTitleBatch(entries, { author: 'system' }),
 });
 const titleRefreshLimit = createRateLimiter({ windowMs: MINUTE_MS, max: 30, message: '标题正在更新，请稍后重试' });
 app.post('/api/title-translations', titleRefreshLimit, (req, res) => {

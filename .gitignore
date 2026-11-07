@@ -19,3 +19,9 @@ data/
 __pycache__/
 *.pyc
 DEPLOYED_COMMIT
+
+# macOS app build artifacts
+src-tauri/target/
+src-tauri/runtime/
+src-tauri/binaries/node-*
+public/purify.min.js
