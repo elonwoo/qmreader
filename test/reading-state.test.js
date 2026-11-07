@@ -43,6 +43,7 @@ function reader() {
     updateRewriteUiLabels() {}, renderReaderStatsUi() {}, renderAssetHelpfulButton() {},
     updateReaderLanguageProfile() {}, applyTextAnnotations() {}, renderReaderAssetSummary() {}, settlePendingAssetJump() {},
     updateEntryAssets() {}, entryAssetHelpfulPatch: () => ({}), renderList() {},
+    pauseReaderMedia() {}, mountReaderMedia() {}, sanitize: html => html,
     renderMarkdownLite: text => `<p>${text}</p>`, rewriteMetaText: () => '',
     maybeGenerateRewriteAfterLoad() {}, setReaderTab: tab => { state.readerTab = tab; },
     requireAuth: () => true, translationAiConfig: () => ({}), rewriteAiConfig: () => ({}), toast() {},
@@ -163,4 +164,58 @@ test('explicit generation shows progress and preserves the reader choice when it
     assert.equal(r.state[kind], asset);
     assert.equal(r.state[kind + 'Generating'], false);
   }
+});
+
+test('Chinese originals open directly even when the default tab is rewrite', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const sandbox = { normalizeReaderOpenTab: tab => tab };
+  vm.runInNewContext(source.slice(source.indexOf('function isChineseNativeEntry'), source.indexOf('function entryRewriteStatus')), sandbox);
+  const wechat = { sourceId: 'wechat-zangai', title: '偷LibTV算力被判三年' };
+  assert.equal(sandbox.initialReaderTab(wechat), 'original');
+  assert.equal(sandbox.initialReaderTab({ language: 'zh-CN' }), 'original');
+  assert.equal(sandbox.initialReaderTab({ language: 'en' }), 'rewrite');
+  assert.equal(sandbox.initialReaderTab(wechat, 'rewrite'), 'rewrite');
+});
+
+test('ready rewrites stay available for Chinese podcasts that open on their show notes', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const sandbox = { assetCountForType: entry => Number(entry.assets?.rewrite || 0) };
+  vm.runInNewContext(source.slice(source.indexOf('function isChineseNativeEntry'), source.indexOf('function rewriteStatusBadgeHtml')), sandbox);
+  for (const sourceId of ['bannatie', 'nexttoken']) {
+    const entry = { sourceId, language: 'zh-CN' };
+    assert.equal(sandbox.initialReaderTab(entry), 'original');
+    assert.equal(sandbox.entryRewriteStatus(entry), 'native');
+    assert.equal(sandbox.entryRewriteStatus({ ...entry, rewriteReady: true }), 'ready');
+    assert.equal(sandbox.entryRewriteStatus({ ...entry, assets: { rewrite: 1 } }), 'ready');
+  }
+});
+
+test('a transient startup list error retries once without reloading the page', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+  const entry = { id: 'first' };
+  let attempts = 0;
+  const sandbox = {
+    state: { view: 'all', optInSources: new Set() },
+    ENTRY_LIST_PAGE_SIZE: 40,
+    ENTRY_RENDER_BATCH_SIZE: 20,
+    URLSearchParams, AbortController,
+    document: { getElementById: () => null },
+    setTimeout: callback => callback(),
+    api: async () => {
+      if (++attempts === 1) throw Object.assign(new Error('Unavailable'), { status: 503 });
+      return { entries: [entry] };
+    },
+  };
+  vm.runInNewContext(source.slice(source.indexOf('const ENTRY_LIST_FIXED_VIEWS'), source.indexOf('function setEntryListUpdating')), sandbox);
+  assert.equal(await sandbox.loadEntries({ retryOnStartup: true }), true);
+  assert.equal(attempts, 2);
+  assert.equal(sandbox.state.entries[0], entry);
+});
+
+
+test('publisher rewrite renders its rich HTML while retaining Markdown for copying', () => {
+  const r = reader();
+  r.renderRewrite({ body: '可复制的 Markdown', bodyHtml: '<p>乔木改写</p><video controls src="https://example.com/video.mp4"></video>' });
+  assert.match(r.$('#rewrite-content').innerHTML, /<video controls/);
+  assert.equal(r.state.rewrite.body, '可复制的 Markdown');
 });

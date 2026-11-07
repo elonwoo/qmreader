@@ -1896,7 +1896,7 @@ function entryListScopeKey() {
   return [state.view, state.filterSource || '', state.filterCategory || '', state.q || '', [...state.optInSources].sort().join(',')].join('|');
 }
 
-async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.view === 'hot' ? 'compact' : 'minimal', growWindow = false } = {}) {
+async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.view === 'hot' ? 'compact' : 'minimal', growWindow = false, retryOnStartup = false } = {}) {
   const scopeKey = entryListScopeKey();
   if (scopeKey !== state.entryListScope) {
     state.entryListScope = scopeKey;
@@ -1932,7 +1932,19 @@ async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.
         } catch { /* A missing/invalid bootstrap must not block API loading. */ }
       }
     }
-    if (!data) data = await api('/api/entries?' + p.toString(), { signal: controller.signal });
+    if (!data) {
+      const url = '/api/entries?' + p.toString();
+      const options = { signal: controller.signal };
+      try {
+        data = await api(url, options);
+      } catch (error) {
+        const transient = error instanceof TypeError || [408, 502, 503, 504].includes(error.status);
+        if (!retryOnStartup || !transient) throw error;
+        await new Promise(resolve => setTimeout(resolve, 750));
+        if (controller.signal.aborted || scopeKey !== entryListScopeKey()) return false;
+        data = await api(url, options);
+      }
+    }
   } catch (err) {
     if (err && err.name === 'AbortError') return false;
     throw err;
@@ -2573,6 +2585,7 @@ function entryHasAssetType(entry, type) {
 
 function isChineseNativeEntry(entry = state.activeEntry) {
   if (!entry) return false;
+  if (String(entry.sourceId || '').startsWith('wechat-')) return true;
   const declared = String(entry.language || entry.lang || '').trim().toLowerCase();
   if (declared) return declared === 'zh' || declared.startsWith('zh-') || declared.startsWith('zh_') || declared === 'cmn';
   const sample = [entry.title, entry.summary].filter(Boolean).join('\n');
@@ -2582,15 +2595,20 @@ function isChineseNativeEntry(entry = state.activeEntry) {
   return cjk >= 8 && cjk / Math.max(1, cjk + latin) >= 0.3;
 }
 
+function initialReaderTab(entry, tab) {
+  if (tab) return normalizeReaderOpenTab(tab);
+  return isChineseNativeEntry(entry) ? 'original' : 'rewrite';
+}
+
 function entryRewriteStatus(entry = state.activeEntry) {
   // 'native' | 'ready' | 'failed' | 'pending'
   if (!entry) return 'pending';
-  if (isChineseNativeEntry(entry)) return 'native';
   const assets = entry.assets && typeof entry.assets === 'object' ? entry.assets : {};
   const raw = String(entry.rewriteStatus || assets.rewriteStatus || '').trim().toLowerCase();
   const readyFlag = entry.rewriteReady !== undefined ? entry.rewriteReady : assets.rewriteReady;
   if (readyFlag === true || raw === 'ready' || raw === 'done' || raw === 'completed') return 'ready';
   if (assetCountForType(entry, 'rewrite') > 0) return 'ready';
+  if (isChineseNativeEntry(entry)) return 'native';
   if (raw === 'failed' || raw === 'error' || raw === 'skipped') return 'failed';
   if (raw === 'pending' || raw === 'running' || raw === 'retry') return 'pending';
   return 'missing';
@@ -2723,7 +2741,7 @@ function visibleEntries() {
       })
       .slice(0, 80);
   }
-  if (state.view === 'unread') list = list.filter(e => !state.read.has(e.id));
+  if (state.view === 'unread') list = list.filter(e => !state.read.has(e.id) || e.id === state.activeEntry?.id);
   if (state.view === 'starred') list = list.filter(e => state.starred.has(e.id));
   if (state.view === 'history') {
     list = list
@@ -4189,7 +4207,7 @@ async function syncVisibleTitles() {
         for (const entry of state.entries) if (entry.id === item.id && entry.title === item.title && entry.titleZh !== item.titleZh) { entry.titleZh = item.titleZh; changed = true; }
         if (state.activeEntry?.id === item.id && state.activeEntry.title === item.title) { state.activeEntry.titleZh = item.titleZh; renderTitle(state.activeEntry); }
       }
-      if (changed) { const list = $('#entry-list'), top = list.scrollTop; renderList(); list.scrollTop = top; }
+      if (changed) renderList();
       if (!result.pending) break;
       await delay(2000);
       if (sequence !== titleSyncSequence) return;
@@ -4204,6 +4222,33 @@ function originalTitleOf(entry) {
   return translated && /[\u3400-\u9fff]/.test(translated) && translated !== title ? title : '';
 }
 
+function captureEntryListPosition(list, selectedId) {
+  if (!list.clientHeight) return null;
+  const bounds = list.getBoundingClientRect();
+  const focused = document.activeElement;
+  const focusedId = focused?.matches('.entry-card') && focused.parentElement === list ? focused.dataset.id : null;
+  const visible = [];
+  for (const card of list.querySelectorAll(':scope > .entry-card')) {
+    const rect = card.getBoundingClientRect();
+    if (rect.bottom <= bounds.top) continue;
+    if (rect.top >= bounds.bottom) break;
+    const anchor = { id: card.dataset.id, offset: rect.top - bounds.top };
+    if (anchor.id === selectedId) visible.unshift(anchor);
+    else visible.push(anchor);
+  }
+  return { visible, focusedId, scrollTop: list.scrollTop };
+}
+
+function restoreEntryListPosition(list, position) {
+  if (!position) return;
+  const cards = new Map([...list.querySelectorAll(':scope > .entry-card')].map(card => [card.dataset.id, card]));
+  const anchor = position.visible.find(item => cards.has(item.id));
+  list.scrollTop = anchor
+    ? list.scrollTop + cards.get(anchor.id).getBoundingClientRect().top - list.getBoundingClientRect().top - anchor.offset
+    : position.scrollTop;
+  cards.get(position.focusedId)?.focus({ preventScroll: true });
+}
+
 function renderList() {
   $('#app').classList.toggle('view-assets', state.view === 'assets');
   $('#app').classList.toggle('view-contributors', state.view === 'contributors');
@@ -4211,15 +4256,21 @@ function renderList() {
   renderListScopeBar();
   renderEntryPaneTabs();
   const scopeEntries = visibleEntries();
-  $('#list-scope-count').textContent = `${scopeEntries.length} 篇 · ${scopeEntries.filter(entry => !state.read.has(entry.id)).length} 未读`;
+  const unreadCount = scopeEntries.filter(entry => !state.read.has(entry.id)).length;
+  const scopeCount = state.view === 'unread' ? unreadCount : scopeEntries.length;
+  $('#list-scope-count').textContent = `${scopeCount} 篇 · ${unreadCount} 未读`;
   $('#list-context-row').classList.toggle('hidden', state.view === 'contributors');
   $('#mark-read-btn').classList.toggle('hidden', state.view === 'contributors' || (isHomeScope() && state.homeTab === 'assets'));
   if (state.view === 'contributors') {
     renderContributorDirectory();
     return;
   }
-  const list = visibleEntries();
+  const list = scopeEntries;
   const el = $('#entry-list');
+  const scope = entryListScopeKey();
+  const sameScope = el.dataset.renderScope === scope;
+  const position = sameScope ? captureEntryListPosition(el, state.activeEntry?.id) : null;
+  el.dataset.renderScope = scope;
   el.innerHTML = '';
   el.classList.remove('home-asset-activity-list');
   renderAssetActivityStrip();
@@ -4369,6 +4420,7 @@ function renderList() {
     frag.appendChild(earlier);
   }
   el.appendChild(frag);
+  restoreEntryListPosition(el, position);
   observeListSentinel(el);
 }
 
@@ -4456,8 +4508,91 @@ function newEntryCount(beforeEntries = [], afterEntries = []) {
 }
 
 /* ---------- Reader ---------- */
+function readerYoutubeId(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !['www.youtube.com', 'youtube.com', 'www.youtube-nocookie.com', 'youtube-nocookie.com'].includes(url.hostname)) return '';
+    return /^\/embed\/([\w-]{11})$/.exec(url.pathname)?.[1] || '';
+  } catch { return ''; }
+}
+
+function pauseReaderMedia(root = $('#reader')) {
+  if (!root?.querySelectorAll) return;
+  root.querySelectorAll('video,audio').forEach(media => media.pause());
+  root.querySelectorAll('[data-reader-youtube]').forEach(container => {
+    container.querySelector('iframe')?.remove();
+    const button = container.querySelector('button');
+    if (button) button.hidden = false;
+  });
+}
+
+function mountReaderMedia(root) {
+  if (!root?.querySelectorAll) return;
+  root.querySelectorAll('video,audio').forEach(media => {
+    media.controls = true;
+    media.preload = 'none';
+    media.removeAttribute('autoplay');
+    media.style.maxWidth = '100%';
+    const url = media.getAttribute('src') || media.querySelector('source')?.getAttribute('src');
+    if (!url || media.dataset.readerMediaBound) return;
+    media.dataset.readerMediaBound = 'true';
+    const fallback = document.createElement('a');
+    fallback.href = url;
+    fallback.target = '_blank';
+    fallback.rel = 'noopener noreferrer';
+    fallback.textContent = media.tagName === 'AUDIO' ? '打开音频原文件' : '打开视频原文件';
+    const line = document.createElement('p');
+    line.append(fallback);
+    media.after(line);
+    media.addEventListener('error', () => { fallback.textContent = '媒体暂时无法播放，打开原文件'; });
+  });
+  root.querySelectorAll('[data-reader-youtube]').forEach(container => {
+    const id = container.dataset.readerYoutube;
+    if (!/^[\w-]{11}$/.test(id) || container.querySelector('button')) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = '加载 YouTube 视频';
+    button.addEventListener('click', () => {
+      const frame = document.createElement('iframe');
+      frame.src = `https://www.youtube-nocookie.com/embed/${id}`;
+      frame.title = 'YouTube 视频播放器';
+      frame.allow = 'encrypted-media; picture-in-picture; fullscreen';
+      frame.allowFullscreen = true;
+      frame.referrerPolicy = 'strict-origin-when-cross-origin';
+      frame.style.cssText = 'width:100%;aspect-ratio:16/9;border:0;display:block';
+      container.prepend(frame);
+      button.hidden = true;
+    });
+    container.prepend(button);
+  });
+}
+
 function sanitize(html, { prioritizeFirstImage = false } = {}) {
   const doc = new DOMParser().parseFromString(html, 'text/html');
+  // Preserve only a verified YouTube embed as an inert, click-to-load placeholder.
+  doc.querySelectorAll('iframe').forEach(frame => {
+    const id = readerYoutubeId(frame.getAttribute('src'));
+    if (!id) { frame.remove(); return; }
+    const placeholder = doc.createElement('div');
+    placeholder.dataset.readerYoutube = id;
+    const link = doc.createElement('a');
+    link.href = `https://www.youtube.com/watch?v=${id}`;
+    link.textContent = '在 YouTube 打开';
+    placeholder.append(link);
+    frame.replaceWith(placeholder);
+  });
+  doc.querySelectorAll('video,audio').forEach(media => {
+    media.setAttribute('controls', '');
+    media.setAttribute('preload', 'none');
+    media.setAttribute('playsinline', '');
+    media.removeAttribute('autoplay');
+  });
+  doc.querySelectorAll('video,audio,source,track').forEach(media => {
+    for (const attr of ['src', 'poster']) {
+      const value = media.getAttribute(attr);
+      if (value && !/^https?:\/\//i.test(value)) media.removeAttribute(attr);
+    }
+  });
   doc.querySelectorAll('script,style,form,iframe,object,embed,button,input,select,textarea,svg,canvas').forEach(n => n.remove());
   doc.querySelectorAll('.pencraft,.pc-reset,.icon-container,.image-link-expand,.view-image,[class*="image-link"],[class*="view-image"]').forEach(n => {
     if (!n.querySelector('img') && !n.textContent.replace(/\s+/g, '').trim()) n.remove();
@@ -5622,7 +5757,9 @@ function renderReaderToc(root = $('#reader-content')) {
 
 function renderOriginalContent(entry, content) {
   const fallback = entry && entry.summary ? `<p>${escapeHtml(entry.summary)}</p>` : '<p>（无内容，请打开原文）</p>';
+  pauseReaderMedia($('#reader-content'));
   $('#reader-content').innerHTML = sanitize(content || fallback, { prioritizeFirstImage: true });
+  mountReaderMedia($('#reader-content'));
   $$('#reader-content a').forEach(a => { a.target = '_blank'; a.rel = 'noopener'; });
   renderReaderToc($('#reader-content'));
   updateReaderLanguageProfile();
@@ -5738,6 +5875,7 @@ function openArticleLinkInWindow() {
 }
 
 function setReaderTab(tab, { syncUrl = true, replaceUrl = true } = {}) {
+  if (state.readerTab !== normalizeReaderTab(tab)) pauseReaderMedia();
   const next = normalizeReaderTab(tab);
   state.readerTab = next;
   $$('.reader-tab').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === next));
@@ -6095,6 +6233,7 @@ function renderRewrite(rewrite, { status = rewrite?.body?.trim() ? 'ready' : 'no
   updateRewriteUiLabels();
   renderReaderStatsUi();
   const content = $('#rewrite-content');
+  pauseReaderMedia(content);
   const empty = $('#rewrite-empty');
   const copy = $('#rewrite-copy');
   const action = $('#reader-rewrite');
@@ -6134,7 +6273,8 @@ function renderRewrite(rewrite, { status = rewrite?.body?.trim() ? 'ready' : 'no
     meta.classList.add('hidden');
   }
   renderAssetHelpfulButton('rewrite', state.rewrite);
-  content.innerHTML = renderMarkdownLite(rewrite.body);
+  content.innerHTML = rewrite.bodyHtml ? sanitize(rewrite.bodyHtml) : renderMarkdownLite(rewrite.body);
+  mountReaderMedia(content);
   $$('#rewrite-content a').forEach(a => { a.target = '_blank'; a.rel = 'noopener'; });
   updateReaderLanguageProfile();
   applyTextAnnotations();
@@ -8641,6 +8781,7 @@ function loadEntryExtrasAfterReading(entry, readingTask, openId) {
 }
 
 async function openEntry(e, { tab = null, focus = null, aiAssetId = '', commentId = '', annotationId = '', chatMessageId = '', updateUrl = true, replaceUrl = false, readingPayload = null } = {}) {
+  pauseReaderMedia();
   const openId = state.articleOpenId = (state.articleOpenId || 0) + 1;
   clearTimeout(state.rewritePollTimer);
   setPodcastMode(false);
@@ -8661,9 +8802,7 @@ async function openEntry(e, { tab = null, focus = null, aiAssetId = '', commentI
     ? 'translation'
     : requestedFocus === 'rewrite'
       ? 'rewrite'
-      : !tab && entryRewriteStatus(e) !== 'native'
-        ? 'rewrite'
-        : normalizeReaderOpenTab(tab);
+      : initialReaderTab(e, tab);
   state.read.add(e.id);
   persist();
 
@@ -8794,6 +8933,7 @@ async function openEntry(e, { tab = null, focus = null, aiAssetId = '', commentI
 }
 
 function closeReaderFromRoute({ rerenderList = true } = {}) {
+  pauseReaderMedia();
   clearTimeout(state.rewritePollTimer);
   setWorkspacePage('');
   state.activeEntry = null;
@@ -8964,10 +9104,11 @@ async function reload({ keepReader = false, clearUrl = true } = {}) {
     // 若已有更新的 reload 在途，updating 状态交给它收尾，避免提前清除
     if (listUpdating && reloadSeq === listReloadSeq) setEntryListUpdating(false);
   }
+  const changedScope = $('#entry-list').dataset.renderScope !== entryListScopeKey();
   updateListTitle();
   renderList();
   renderSidebar();
-  if (listUpdating) restoreEntryListScroll();
+  if (listUpdating && changedScope) restoreEntryListScroll();
   if (!keepReader) {
     setWorkspacePage('');
     state.activeEntry = null;
@@ -11286,7 +11427,7 @@ window.addEventListener('popstate', () => { mobileReaderFromList = false; });
         if (state.entries.length) renderList();
         return value;
       }).catch(() => { toast('频道信息暂未同步，文章仍可阅读', 4000); return { refreshing: false }; });
-      await loadEntries({ summary: route.view === 'assets' ? 'full' : route.view === 'hot' ? 'compact' : 'minimal' });
+      await loadEntries({ summary: route.view === 'assets' ? 'full' : route.view === 'hot' ? 'compact' : 'minimal', retryOnStartup: true });
       updateListTitle(); renderList();
       // Catalog is supplementary; never gate first-paint on it.
       void catalogTask;
