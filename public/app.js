@@ -664,6 +664,7 @@ const state = {
   entryListLimit: ENTRY_LIST_PAGE_SIZE,
   entryListHasMore: false,
   entriesLoadingMore: false,
+  counts: null,
   contributors: [],
   adminSubmissionUsers: [],
   adminSubmissionRequests: [],
@@ -703,6 +704,8 @@ const state = {
   pendingAnnotationId: '',
   agentContext: null,
   readerNavBusy: false,
+  revealEntryId: '',
+  revealUntil: 0,
   contextPanel: 'agent',
   myTranslations: [],
   myRewrites: [],
@@ -1956,6 +1959,19 @@ async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.
   return true;
 }
 
+// 列表一次只装一屏，「40+」是窗口不是全量。徽标改问服务端要真实总数。
+async function refreshEntryCounts() {
+  try {
+    const p = new URLSearchParams();
+    if (state.optInSources.size) p.set('optIn', [...state.optInSources].join(','));
+    const data = await api(`/api/counts${p.toString() ? `?${p}` : ''}`);
+    state.counts = { unread: Number(data.unread) || 0, bySource: data.bySource || {} };
+    renderSidebar();
+  } catch {
+    // 计数拿不到就退回窗口内统计，不影响读文章。
+  }
+}
+
 function setEntryListUpdating(updating) {
   const el = $('#entry-list');
   if (!el) return;
@@ -2236,17 +2252,187 @@ function entryBelongsToSource(entry, sourceId) {
   return Boolean(entry && (entry.sourceId === sourceId || (Array.isArray(entry.feedSourceIds) && entry.feedSourceIds.includes(sourceId))));
 }
 
+// 全量未读由服务端按 user_entry_states.read_at 算；在它回来之前先用窗口内统计兜底。
+function sourceUnreadLabel(sourceId) {
+  const bySource = state.counts && state.counts.bySource;
+  if (bySource && Number.isFinite(bySource[sourceId])) return bySource[sourceId] || '';
+  return unreadCountFor(entry => entryBelongsToSource(entry, sourceId)) || '';
+}
+
+function groupUnreadLabel(list) {
+  const bySource = state.counts && state.counts.bySource;
+  if (!bySource) return '';
+  const total = list.reduce((sum, source) => sum + (Number(bySource[source.id]) || 0), 0);
+  return total || '';
+}
+
+function groupCountNode(value) {
+  const span = document.createElement('span');
+  span.className = 'group-count';
+  span.textContent = value ? String(value) : '';
+  return span;
+}
+
+let sidebarContextMenu = null;
+let sidebarContextMenuSource = null;
+
+function closeSidebarContextMenu() {
+  if (!sidebarContextMenu || sidebarContextMenu.hidden) return;
+  sidebarContextMenu.hidden = true;
+  sidebarContextMenuSource = null;
+}
+
+function ensureSidebarContextMenu() {
+  if (sidebarContextMenu) return sidebarContextMenu;
+  const menu = document.createElement('div');
+  menu.className = 'sidebar-context-menu';
+  menu.setAttribute('role', 'menu');
+  menu.hidden = true;
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.className = 'sidebar-context-menu-item';
+  item.setAttribute('role', 'menuitem');
+  item.textContent = '标为已读';
+  item.onclick = () => {
+    const source = sidebarContextMenuSource;
+    closeSidebarContextMenu();
+    if (source) void markSidebarSourceRead(source);
+  };
+  menu.appendChild(item);
+  document.body.appendChild(menu);
+  sidebarContextMenu = menu;
+  document.addEventListener('pointerdown', event => {
+    if (menu.hidden || menu.contains(event.target)) return;
+    closeSidebarContextMenu();
+  }, true);
+  document.addEventListener('keydown', event => {
+    if (!menu.hidden && event.key === 'Escape') {
+      event.preventDefault();
+      closeSidebarContextMenu();
+    }
+  });
+  window.addEventListener('scroll', () => closeSidebarContextMenu(), true);
+  window.addEventListener('blur', () => closeSidebarContextMenu());
+  window.addEventListener('resize', () => closeSidebarContextMenu());
+  return menu;
+}
+
+function openSidebarContextMenu(event, source) {
+  if (!source || !source.id) return;
+  const menu = ensureSidebarContextMenu();
+  sidebarContextMenuSource = source;
+  menu.hidden = false;
+  const pad = 8;
+  const width = menu.offsetWidth;
+  const height = menu.offsetHeight;
+  const left = Math.min(Math.max(pad, event.clientX), Math.max(pad, window.innerWidth - width - pad));
+  const top = Math.min(Math.max(pad, event.clientY), Math.max(pad, window.innerHeight - height - pad));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function bindSidebarSourceContextMenu(el, source) {
+  el.oncontextmenu = event => {
+    event.preventDefault();
+    // WebKit still selects the word under the cursor for the right-click
+    // gesture, which paints the row blue behind the menu.
+    const clearSelection = () => {
+      const selection = window.getSelection();
+      if (selection) selection.removeAllRanges();
+    };
+    clearSelection();
+    requestAnimationFrame(clearSelection);
+    openSidebarContextMenu(event, source);
+  };
+}
+
+async function markSidebarSourceRead(source) {
+  if (!source || !source.id || !requireAuth('login')) return;
+  try {
+    await api(`/api/sources/${encodeURIComponent(source.id)}/mark-read`, { method: 'POST' });
+    await loadUserEntryStates().catch(() => null);
+    await refreshEntryCounts();
+    await reload({ keepReader: true, clearUrl: false });
+    toast(`已把「${source.name || source.id}」标为已读`);
+  } catch (error) {
+    toast(`标记失败：${error.message}`, 4000);
+  }
+}
+
 function renderSidebar() {
   const groups = { article: [], news: [], podcast: [], community: [] };
-  for (const s of state.sources) if (s.enabled && (!s.optIn || (s.category === 'podcast' && state.optInSources.has(s.id)))) groups[s.category]?.push(s);
+  const customRssSources = state.sources.filter(s => s.customRss && s.enabled);
+  for (const s of state.sources) {
+    if (s.customRss) continue;
+    if (s.enabled && (!s.optIn || (s.category === 'podcast' && state.optInSources.has(s.id)))) groups[s.category]?.push(s);
+  }
 
   const wrap = $('#feed-groups');
   wrap.innerHTML = '';
+
+  const rssLabel = document.createElement('div');
+  rssLabel.className = 'group-label wechat-group-label';
+  rssLabel.textContent = '我的订阅';
+  const rssAdd = document.createElement('button');
+  rssAdd.type = 'button';
+  rssAdd.className = 'wechat-add-btn';
+  rssAdd.setAttribute('aria-label', '添加 RSS 订阅');
+  rssAdd.title = '添加 RSS 订阅';
+  setElementIcon(rssAdd, 'plus');
+  rssAdd.onclick = event => { event.stopPropagation(); openRssSubscribe(rssAdd); };
+  rssLabel.appendChild(groupCountNode(groupUnreadLabel(customRssSources)));
+  rssLabel.appendChild(rssAdd);
+  const rssCollapsed = collapsedGroups.has('rss');
+  rssLabel.classList.toggle('collapsed', rssCollapsed);
+  rssLabel.prepend(groupToggleButton('rss', rssCollapsed));
+  wrap.appendChild(rssLabel);
+  if (!rssCollapsed) {
+    if (!customRssSources.length) {
+      const empty = document.createElement('div');
+      empty.className = 'rss-subscribe-empty';
+      empty.textContent = '还没有订阅，点 + 添加';
+      wrap.appendChild(empty);
+    } else {
+      for (const s of customRssSources) {
+        const row = document.createElement('div');
+        row.className = 'feed-item rss-feed-item' + (state.filterSource === s.id ? ' active' : '');
+        row.setAttribute('role', 'button');
+        row.tabIndex = 0;
+        const unread = sourceUnreadLabel(s.id);
+        row.innerHTML = `${faviconHtml(s.siteUrl, s.name)}
+          <span class="fname" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
+          ${s.status === 'error' ? '<span class="err-dot" title="抓取失败"></span>' : ''}
+          <span class="fcount">${unread || ''}</span>`;
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'rss-delete-btn';
+        del.setAttribute('aria-label', `删除订阅 ${s.name}`);
+        del.title = '删除订阅';
+        del.textContent = '×';
+        del.onclick = event => { event.stopPropagation(); void deleteRssSubscription(s, del); };
+        row.appendChild(del);
+        row.onclick = () => selectSource(s.id);
+        row.onkeydown = event => {
+          if (event.target !== row) return;
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            selectSource(s.id);
+          }
+        };
+        bindSidebarSourceContextMenu(row, s);
+        wrap.appendChild(row);
+      }
+    }
+  }
+
   for (const [cat, list] of Object.entries(groups)) {
     if (!list.length) continue;
+    // Reader submissions keep showing up in 全部, but the group itself is noise here.
+    if (cat === 'community') continue;
     const label = document.createElement('div');
     label.className = 'group-label';
     label.textContent = CATEGORY_LABELS[cat];
+    label.appendChild(groupCountNode(groupUnreadLabel(list)));
     label.style.cursor = 'pointer';
     label.title = `查看全部${CATEGORY_LABELS[cat]}`;
     label.onclick = () => selectCategory(cat);
@@ -2270,12 +2456,13 @@ function renderSidebar() {
     for (const s of list) {
       const btn = document.createElement('button');
       btn.className = 'feed-item' + (state.filterSource === s.id ? ' active' : '');
-      const unread = unreadCountFor(e => entryBelongsToSource(e, s.id));
+      const unread = sourceUnreadLabel(s.id);
       btn.innerHTML = `${faviconHtml(s.siteUrl, s.name)}
         <span class="fname" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}${s.id.startsWith('podscribe-') ? ' · 文稿' : ''}</span>
         ${s.status === 'error' ? '<span class="err-dot" title="抓取失败"></span>' : ''}
         <span class="fcount">${unread || ''}</span>`;
       btn.onclick = () => selectSource(s.id);
+      bindSidebarSourceContextMenu(btn, s);
       wrap.appendChild(btn);
     }
   }
@@ -2285,6 +2472,7 @@ function renderSidebar() {
     const label = document.createElement('div');
     label.className = 'group-label wechat-group-label';
     label.textContent = '微信公众号';
+    label.appendChild(groupCountNode(groupUnreadLabel(wechatSources)));
     const add = document.createElement('button');
     add.type = 'button';
     add.className = 'wechat-add-btn';
@@ -2300,16 +2488,18 @@ function renderSidebar() {
     for (const s of visibleWechat) {
       const btn = document.createElement('button');
       btn.className = 'feed-item' + (state.filterSource === s.id ? ' active' : '');
-      const unread = unreadCountFor(entry => entryBelongsToSource(entry, s.id));
+      const unread = sourceUnreadLabel(s.id);
       btn.innerHTML = `${faviconHtml(s.siteUrl, s.name)}<span class="fname">${escapeHtml(s.name)}</span><span class="fcount">${unread || ''}</span>`;
       btn.onclick = () => selectSource(s.id);
+      bindSidebarSourceContextMenu(btn, s);
       wrap.appendChild(btn);
     }
   }
 
-  $('#count-all').textContent = entryWindowCountLabel(state.entries.length);
+  // 「全部」不显示数字：库里的总量没有阅读上的意义，未读才值得看。
+  $('#count-all').textContent = '';
   $('#count-hot').textContent = entryWindowCountLabel(hotEntryCount());
-  $('#count-unread').textContent = entryWindowCountLabel(unreadCountFor(() => true));
+  $('#count-unread').textContent = state.counts ? (state.counts.unread ? String(state.counts.unread) : '') : entryWindowCountLabel(unreadCountFor(() => true));
   $('#count-starred').textContent = state.starred.size || '';
   $('#count-history').textContent = state.history.size || '';
   $('#count-contributors').textContent = state.contributors.length || '';
@@ -2318,6 +2508,146 @@ function renderSidebar() {
   syncMobileTabbar(); // UI-MOBILE
 
   $$('.view-btn[data-view]').forEach(b => b.classList.toggle('active', !$('#app').classList.contains('podscribe-mode') && b.dataset.view === state.view && !state.filterSource && !state.filterCategory));
+}
+
+let rssSubscribeTrigger = null;
+
+function openRssSubscribe(trigger) {
+  if (!state.me) {
+    openAuth('login');
+    return;
+  }
+  rssSubscribeTrigger = trigger || document.activeElement;
+  $('#rss-subscribe-url').value = '';
+  $('#rss-subscribe-name').value = '';
+  $('#rss-subscribe-opml').value = '';
+  $('#rss-subscribe-status').textContent = '';
+  $('#rss-subscribe-submit').disabled = false;
+  $('#rss-opml-import').disabled = false;
+  $('#rss-subscribe-modal').classList.remove('hidden');
+  $('#rss-subscribe-url').focus();
+}
+
+function closeRssSubscribe() {
+  $('#rss-subscribe-modal').classList.add('hidden');
+  if (rssSubscribeTrigger?.isConnected) rssSubscribeTrigger.focus();
+}
+
+function rssSubscribeStatus(message) {
+  $('#rss-subscribe-status').textContent = message;
+}
+
+async function submitRssSubscribe(event) {
+  event.preventDefault();
+  const url = $('#rss-subscribe-url').value.trim();
+  const name = $('#rss-subscribe-name').value.trim();
+  if (!url) {
+    rssSubscribeStatus('请输入 RSS 地址');
+    $('#rss-subscribe-url').focus();
+    return;
+  }
+  const button = $('#rss-subscribe-submit');
+  button.disabled = true;
+  button.textContent = '添加中…';
+  rssSubscribeStatus('正在验证订阅地址…');
+  try {
+    const data = await api('/api/rss/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, ...(name ? { name } : {}) }),
+    });
+    await loadSources();
+    await reload({ keepReader: true, clearUrl: false });
+    closeRssSubscribe();
+    toast(data.added ? '订阅成功，正在拉取第一批文章' : '这个订阅已经在列表里了', 4000);
+    if (data.source?.id) selectSource(data.source.id);
+  } catch (error) {
+    rssSubscribeStatus(`添加失败：${error.message}`);
+    button.disabled = false;
+    button.textContent = '添加';
+  }
+}
+
+function parseRssOpml(text) {
+  const doc = new DOMParser().parseFromString(String(text || ''), 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('OPML 解析失败，请检查文件内容');
+  const items = [];
+  for (const outline of doc.querySelectorAll('outline')) {
+    const url = String(outline.getAttribute('xmlUrl') || '').trim();
+    if (!url) continue;
+    const name = String(outline.getAttribute('title') || outline.getAttribute('text') || '').trim();
+    items.push({ url, name });
+  }
+  return items;
+}
+
+async function importRssOpml() {
+  const text = $('#rss-subscribe-opml').value.trim();
+  if (!text) {
+    rssSubscribeStatus('请粘贴 OPML 文本或选择 .opml / .xml 文件');
+    return;
+  }
+  let items;
+  try {
+    items = parseRssOpml(text);
+  } catch (error) {
+    rssSubscribeStatus(error.message);
+    return;
+  }
+  if (!items.length) {
+    rssSubscribeStatus('没有找到带 xmlUrl 的订阅');
+    return;
+  }
+  if (items.length > 50) {
+    rssSubscribeStatus(`一次最多导入 50 个订阅，当前有 ${items.length} 个`);
+    return;
+  }
+  const names = {};
+  for (const item of items) if (item.name) names[item.url] = item.name;
+  const button = $('#rss-opml-import');
+  button.disabled = true;
+  button.textContent = '导入中…';
+  rssSubscribeStatus(`正在导入 ${items.length} 个订阅…`);
+  try {
+    const data = await api('/api/rss/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ urls: items.map(item => item.url), names }),
+    });
+    const results = Array.isArray(data.results) ? data.results : [];
+    const failed = results.filter(result => !result.ok);
+    const okCount = results.filter(result => result.ok).length;
+    rssSubscribeStatus(failed.length
+      ? `导入完成：成功 ${okCount} 个，失败 ${failed.length} 个。${failed.map(result => `${result.url}（${result.error}）`).join('；')}`
+      : `导入完成：成功 ${okCount} 个订阅`);
+    await loadSources();
+    await reload({ keepReader: true, clearUrl: false });
+    if (!failed.length) $('#rss-subscribe-opml').value = '';
+  } catch (error) {
+    rssSubscribeStatus(`导入失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = '导入 OPML';
+  }
+}
+
+async function deleteRssSubscription(source, trigger) {
+  if (!state.me) {
+    openAuth('login');
+    return;
+  }
+  if (!window.confirm(`确定删除订阅「${source.name}」吗？该源的全部历史文章也会一起删除，且无法恢复。`)) return;
+  trigger.disabled = true;
+  try {
+    const data = await api(`/api/rss/unsubscribe/${encodeURIComponent(source.id)}`, { method: 'POST' });
+    if (state.filterSource === source.id) state.filterSource = null;
+    await loadSources();
+    await reload({ keepReader: true, clearUrl: false });
+    toast(`已删除「${source.name}」，同时移除 ${Number(data.deletedEntries) || 0} 篇文章`, 4000);
+  } catch (error) {
+    trigger.disabled = false;
+    toast(`删除失败：${error.message}`, 5000);
+  }
 }
 
 const PODCAST_RECOMMENDATIONS = [
@@ -4236,16 +4566,35 @@ function captureEntryListPosition(list, selectedId) {
     if (anchor.id === selectedId) visible.unshift(anchor);
     else visible.push(anchor);
   }
-  return { visible, focusedId, scrollTop: list.scrollTop };
+  return { visible, focusedId, selectedId, scrollTop: list.scrollTop };
 }
 
 function restoreEntryListPosition(list, position) {
   if (!position) return;
   const cards = new Map([...list.querySelectorAll(':scope > .entry-card')].map(card => [card.dataset.id, card]));
-  const anchor = position.visible.find(item => cards.has(item.id));
-  list.scrollTop = anchor
-    ? list.scrollTop + cards.get(anchor.id).getBoundingClientRect().top - list.getBoundingClientRect().top - anchor.offset
-    : position.scrollTop;
+  // Right after a j/k jump the active card is pinned to the top of the list, so
+  // the eye keeps a fixed line while the list walks down one card at a time.
+  // Only keyboard navigation sets position.reveal; clicking a card leaves the
+  // list where it is and every other re-render preserves the old viewport.
+  const selected = position.reveal && position.selectedId ? cards.get(position.selectedId) : null;
+  if (selected) {
+    list.scrollTop = 0;
+    const offset = selected.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    list.scrollTop = Math.max(0, offset - 12);
+  } else {
+    const anchor = position.visible.find(item => cards.has(item.id));
+    if (!anchor) {
+      list.scrollTop = position.scrollTop;
+    } else {
+      // A rebuilt list still reports the previous offset until the next layout, so
+      // adding the anchor delta to it re-added the same jump on every renderList
+      // call (one j/k fires several) and the list ran away down the page. Measure
+      // from an explicit zero baseline instead.
+      list.scrollTop = 0;
+      const cardOffset = cards.get(anchor.id).getBoundingClientRect().top - list.getBoundingClientRect().top;
+      list.scrollTop = Math.max(0, cardOffset - anchor.offset);
+    }
+  }
   cards.get(position.focusedId)?.focus({ preventScroll: true });
 }
 
@@ -4270,6 +4619,7 @@ function renderList() {
   const scope = entryListScopeKey();
   const sameScope = el.dataset.renderScope === scope;
   const position = sameScope ? captureEntryListPosition(el, state.activeEntry?.id) : null;
+  if (position && state.activeEntry?.id === state.revealEntryId && Date.now() < state.revealUntil) position.reveal = true;
   el.dataset.renderScope = scope;
   el.innerHTML = '';
   el.classList.remove('home-asset-activity-list');
@@ -9108,6 +9458,7 @@ async function reload({ keepReader = false, clearUrl = true } = {}) {
   updateListTitle();
   renderList();
   renderSidebar();
+  void refreshEntryCounts();
   if (listUpdating && changedScope) restoreEntryListScroll();
   if (!keepReader) {
     setWorkspacePage('');
@@ -11053,6 +11404,31 @@ $('#podcast-subscribe-modal').addEventListener('keydown', event => {
   if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
 });
+$('#rss-subscribe-close').onclick = closeRssSubscribe;
+$('#rss-subscribe-modal').onclick = event => { if (event.target.id === 'rss-subscribe-modal') closeRssSubscribe(); };
+$('#rss-subscribe-form').onsubmit = submitRssSubscribe;
+$('#rss-opml-import').onclick = () => { void importRssOpml(); };
+$('#rss-opml-file-btn').onclick = () => $('#rss-opml-file').click();
+$('#rss-opml-file').onchange = async event => {
+  const file = event.target.files && event.target.files[0];
+  event.target.value = '';
+  if (!file) return;
+  try {
+    const text = await file.text();
+    $('#rss-subscribe-opml').value = text.slice(0, 2_000_000);
+    rssSubscribeStatus(`已载入 ${file.name}，点击「导入 OPML」开始`);
+  } catch {
+    rssSubscribeStatus('读取文件失败，请重试');
+  }
+};
+$('#rss-subscribe-modal').addEventListener('keydown', event => {
+  if (event.key === 'Escape') { event.preventDefault(); closeRssSubscribe(); }
+  if (event.key !== 'Tab') return;
+  const focusable = [...$('#rss-subscribe-modal').querySelectorAll('button:not(:disabled), input:not([hidden]), textarea')];
+  const first = focusable[0], last = focusable.at(-1);
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+});
 $('#auth-open').onclick = () => openAuth('login');
 $('#auth-close').onclick = closeAuth;
 $('#auth-modal').onclick = (e) => { if (e.target.id === 'auth-modal') closeAuth(); };
@@ -11142,6 +11518,8 @@ function pulseReaderNavEdge(direction) {
 async function openVisibleEntryWithMotion(entry, direction) {
   if (!entry || state.readerNavBusy) return;
   state.readerNavBusy = true;
+  state.revealEntryId = entry.id;
+  state.revealUntil = Date.now() + 1500;
   const reader = $('#reader');
   clearReaderNavClasses(reader);
   reader?.classList.add(readerNavClass(direction, 'exit'));
@@ -11450,6 +11828,8 @@ window.addEventListener('popstate', () => { mobileReaderFromList = false; });
       else await loadEntries();
       updateListTitle(); renderList(); renderSidebar();
     }
+    // 开机这条路不经过 reload()，未读计数要单独拉一次。
+    void refreshEntryCounts();
   } catch (e) {
     toast('加载失败: ' + e.message, 5000);
     $('#entry-list').innerHTML = `<div class="list-empty">数据加载失败：${escapeHtml(e.message)}<br/><button class="ghost-btn" onclick="location.reload()" style="margin-top:10px">重新加载</button></div>`;

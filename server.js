@@ -18,7 +18,7 @@ const { mountYoutubeNotes } = require('./lib/youtube-notes');
 const podcastTranscript = require('./lib/podcast-transcript');
 const podscribe = require('./lib/podscribe');
 const wechatCatalog = require('./lib/wechat-catalog');
-const { SOURCES, registerPodcastSource, registerWechatSource } = require('./lib/sources');
+const { SOURCES, registerPodcastSource, registerWechatSource, subscribeRssSources, deleteRssSource } = require('./lib/sources');
 const podscribeEntry = require('./lib/podscribe-entry');
 const { createResponseCache, sendCached, compactEntry, dataStamp } = require('./lib/response-cache');
 const { clientIp } = require('./lib/client-ip');
@@ -267,6 +267,12 @@ const podcastSubscribeRateLimit = createRateLimiter({
   windowMs: 60 * 60 * 1000,
   max: 12,
   message: '播客订阅过于频繁，请稍后再试',
+  key: req => `user:${req.user?.id || clientIp(req) || 'anonymous'}`,
+});
+const rssSubscribeRateLimit = createRateLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 20,
+  message: 'RSS 订阅操作过于频繁，请稍后再试',
   key: req => `user:${req.user?.id || clientIp(req) || 'anonymous'}`,
 });
 const podscribeRewriteRateLimit = createRateLimiter({
@@ -2994,6 +3000,50 @@ app.post('/api/wechat/subscribe', requireLogin, podcastSubscribeRateLimit, async
   } catch (error) { sendError(res, error, '订阅微信公众号失败'); }
 });
 
+app.post('/api/rss/subscribe', requireLogin, rssSubscribeRateLimit, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const isBatch = Array.isArray(body.urls);
+    let items;
+    if (isBatch) {
+      const names = body.names && typeof body.names === 'object' ? body.names : {};
+      items = body.urls.map(url => ({ url, name: names[String(url)] }));
+    } else {
+      items = [{ url: body.url, name: body.name }];
+    }
+    const results = await subscribeRssSources(items);
+    const addedSources = results.filter(result => result.ok && result.added).map(result => result.source);
+    if (addedSources.length === 1) {
+      startBackgroundJob({ kind: 'refresh', sourceId: addedSources[0].id, sourceIds: [addedSources[0].id] });
+    } else if (addedSources.length > 1) {
+      startBackgroundJob({ kind: 'refresh', sourceIds: addedSources.map(source => source.id) });
+    }
+    publicApiCache.clear();
+    if (isBatch) return res.json({ results, added: addedSources.length });
+    const result = results[0];
+    if (!result || !result.ok) return res.status(400).json({ error: result ? result.error : '订阅地址无效' });
+    res.status(result.added ? 201 : 200).json({ source: result.source, added: result.added });
+  } catch (error) { sendError(res, error, '订阅 RSS 失败'); }
+});
+
+// POST rather than DELETE: the DR gate in lib/dr/primary-gate.cjs rejects every
+// /api/* DELETE with 503 when no control service is configured, which is always
+// the case in the desktop build.
+app.post('/api/rss/unsubscribe/:id', requireLogin, async (req, res) => {
+  try {
+    const result = deleteRssSource(req.params.id, { store });
+    fetcher.forgetSource(result.source.id);
+    fetcher.flushDisk();
+    publicApiCache.clear();
+    res.json({
+      deleted: true,
+      id: result.source.id,
+      deletedEntries: result.entries,
+      deletedRewriteJobs: result.rewriteJobs,
+    });
+  } catch (error) { sendError(res, error, '取消 RSS 订阅失败'); }
+});
+
 app.post('/api/podscribe/subscribe', requireLogin, podcastSubscribeRateLimit, async (req, res) => {
   try {
     const slug = String(req.body?.slug || '');
@@ -3062,6 +3112,17 @@ app.get('/api/podscribe/rewrite-jobs/:jobId', requireAdmin, (req, res) => {
 app.use(require('./.rss-reliability/health.cjs').middleware(fetcher, backgroundJobState));
 
 const publicApiCache = createResponseCache({ ttlMs: 10000, max: 300 });
+
+// Sidebar badges: the list loads a window at a time, so its own length can only
+// say "40+". These are real totals for the same source set the list shows.
+app.get('/api/counts', (req, res) => {
+  const optIn = [...new Set(String(req.query.optIn || '').split(',').filter(Boolean))];
+  res.setHeader('Cache-Control', 'private, no-cache');
+  res.json(fetcher.countEntries({
+    allowedOptInSourceIds: new Set(optIn),
+    userId: req.user ? req.user.id : '',
+  }));
+});
 
 app.get('/api/sources', (req, res) => {
   const requireRewrite = req.query.ready === 'rewrite';
@@ -4134,6 +4195,17 @@ app.post('/api/sources/:id/toggle', requireAdmin, async (req, res) => {
     sourceIds: [src.id],
   });
   res.json({ id: src.id, enabled });
+});
+
+app.post('/api/sources/:id/mark-read', requireLogin, (req, res) => {
+  const src = fetcher.getSourceById(req.params.id);
+  if (!src) return res.status(404).json({ error: 'source not found' });
+  try {
+    const marked = store.markSourceRead(req.user.id, src.id);
+    res.json({ id: src.id, marked });
+  } catch (e) {
+    sendError(res, e, 'mark source read failed');
+  }
 });
 
 const server = app.listen(PORT, HOST, () => {

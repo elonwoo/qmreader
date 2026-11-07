@@ -17,7 +17,7 @@
   <meta name="apple-mobile-web-app-title" content="QMReader" />
   <link rel="stylesheet" href="/discovery.css?v=1" />
 
-  <link rel="stylesheet" href="/styles.css?v=sidebar-groups-20261107" />
+  <link rel="stylesheet" href="/styles.css?v=jk-pin-20261108" />
   <meta name="description" content="精选中英文 RSS，AI 自动译成好读的中文，边读边问 AI 的阅读器。" />
   <link rel="canonical" href="https://rss.qiaomu.ai/" />
   <meta property="og:site_name" content="QMReader" />
@@ -48,7 +48,7 @@
     }, { once: true });
   </script>
   <link rel="stylesheet" href="/web-collection.css?v=1.0.0">
-  <link rel="stylesheet" href="/workbench.css?v=chinese-state-20261028">
+  <link rel="stylesheet" href="/workbench.css?v=sidebar-unread-2-20261108">
   <link rel="stylesheet" href="/ai-settings.css?v=20261028-test1">
 </head>
 <body data-theme="light">
@@ -691,6 +691,40 @@
     </div>
   </div>
 
+  <div id="rss-subscribe-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="rss-subscribe-title">
+    <div class="modal-box rss-subscribe-box">
+      <header>
+        <div>
+          <h2 id="rss-subscribe-title">添加订阅</h2>
+          <p>粘贴 RSS / Atom / JSON Feed 地址，或导入 OPML。</p>
+        </div>
+        <button class="icon-btn" id="rss-subscribe-close" type="button" aria-label="关闭添加订阅"><span data-qm-icon="x"></span></button>
+      </header>
+      <form id="rss-subscribe-form" class="rss-subscribe-form">
+        <label>
+          <span>订阅地址</span>
+          <input id="rss-subscribe-url" type="url" maxlength="2000" autocomplete="off" placeholder="https://example.com/feed.xml" />
+        </label>
+        <label>
+          <span>名称（选填）</span>
+          <input id="rss-subscribe-name" type="text" maxlength="150" autocomplete="off" placeholder="留空时使用源标题或域名" />
+        </label>
+        <button id="rss-subscribe-submit" class="ghost-btn primary" type="submit">添加</button>
+      </form>
+      <div class="rss-opml-section">
+        <h3>从 OPML 批量导入</h3>
+        <p class="rss-subscribe-hint">粘贴 OPML 文本，或选择 .opml / .xml 文件；一次最多 50 个订阅。</p>
+        <textarea id="rss-subscribe-opml" rows="6" placeholder="<opml>...</opml>"></textarea>
+        <div class="rss-opml-actions">
+          <input id="rss-opml-file" type="file" accept=".opml,.xml,text/xml,application/xml,text/x-opml" hidden />
+          <button id="rss-opml-file-btn" class="ghost-btn" type="button">选择文件</button>
+          <button id="rss-opml-import" class="ghost-btn" type="button">导入 OPML</button>
+        </div>
+      </div>
+      <p id="rss-subscribe-status" class="rss-subscribe-status" role="status" aria-live="polite"></p>
+    </div>
+  </div>
+
   <div id="auth-modal" class="modal hidden">
     <div class="modal-box auth-box">
       <header><h2 id="auth-title">登录</h2><button class="icon-btn" id="auth-close" aria-label="关闭登录弹窗"><span data-qm-icon="x"></span></button></header>
@@ -858,7 +892,7 @@
   <script defer src="/ranking.js?v=1"></script>
   <script defer src="/pwa.js?v=1"></script>
   <script defer src="/native-bridge.js"></script>
-  <script defer src="/app.js?v=upstream-merge-20261107"></script>
+  <script defer src="/app.js?v=jk-pin-20261108"></script>
   <script defer src="/podscribe.js?v=6"></script>
   <script defer src="/web-collection.js?v=1.0.0"></script>
   <script defer src="/workbench.js?v=upstream-merge-20261107"></script>

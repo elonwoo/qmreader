@@ -435,7 +435,7 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
   display: flex; align-items: center; gap: 9px;
   padding: 6px 10px; border-radius: 8px;
   color: var(--text-1); font-size: 13px;
-  cursor: pointer; user-select: none;
+  cursor: pointer; user-select: none; -webkit-user-select: none;
   border: none; background: none; width: 100%; text-align: left;
 }
 .feed-item:hover { background: var(--bg-2); color: var(--text-0); }
@@ -453,9 +453,30 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 .feed-item .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .feed-item .fcount { font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .feed-item .err-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--semantic-red); flex: none; }
-.wechat-group-label { justify-content: space-between; }
-.wechat-add-btn { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border: 0; border-radius: 6px; background: transparent; color: var(--text-1); cursor: pointer; }
+.sidebar-context-menu {
+  position: fixed; z-index: 120; min-width: 140px; padding: 4px;
+  display: grid; gap: 2px;
+  background: var(--bg-1); border: 1px solid var(--border);
+  border-radius: var(--radius-md); box-shadow: 0 10px 30px var(--shadow-soft);
+}
+.sidebar-context-menu[hidden] { display: none; }
+.sidebar-context-menu-item {
+  display: block; width: 100%; padding: 7px 10px;
+  border: 0; border-radius: var(--radius-sm); background: none;
+  color: var(--text-0); font: inherit; font-size: 13px;
+  text-align: left; white-space: nowrap; cursor: pointer;
+}
+.sidebar-context-menu-item:hover,
+.sidebar-context-menu-item:focus-visible { background: var(--bg-2); outline: none; }
+.wechat-group-label { justify-content: flex-start; }
+/* margin-left:auto pins the + to the right edge; space-between used to stretch
+   the bare text node into the middle, so 播客 / 我的订阅 looked centered. */
+.wechat-add-btn { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; margin-left: auto; border: 0; border-radius: 6px; background: transparent; color: var(--text-1); cursor: pointer; }
 .wechat-add-btn:hover, .wechat-add-btn:focus-visible { background: var(--bg-2); color: var(--text-0); }
+.group-count {
+  color: var(--text-2); font-size: 11px; font-weight: 500; letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
 #wechat-modal .wechat-catalog-box { width: min(620px, calc(100vw - 32px)); max-height: min(760px, calc(100dvh - 48px)); overflow: hidden; background: var(--bg-1); box-shadow: 0 2px 8px var(--shadow-soft), 0 24px 72px var(--shadow); }
 #wechat-modal .wechat-catalog-box > header { flex: none; padding: 20px 24px 18px; }
 #wechat-modal .wechat-catalog-box h2 { font-size: 18px; font-weight: 600; line-height: 1.5; }
@@ -521,6 +542,29 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 .podcast-subscribe-info strong { color: var(--text-0); font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
 .podcast-subscribe-info span, .podcast-subscribe-empty { color: var(--text-2); font-size: 12px; line-height: 1.5; }
 .podcast-subscribe-row .ghost-btn { flex: none; min-width: 58px; }
+
+.rss-subscribe-empty { padding: 5px 10px 8px; color: var(--text-2); font-size: 12px; }
+.rss-feed-item { position: relative; }
+.rss-delete-btn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-right: -2px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--text-2); font-size: 16px; line-height: 1; cursor: pointer; flex: none; }
+.rss-delete-btn:hover, .rss-delete-btn:focus-visible { background: var(--bg-3); color: var(--semantic-red); }
+@media (hover: hover) and (pointer: fine) {
+  .rss-feed-item .rss-delete-btn { opacity: 0; }
+  .rss-feed-item:hover .rss-delete-btn, .rss-feed-item:focus-within .rss-delete-btn { opacity: 1; }
+}
+#rss-subscribe-modal .rss-subscribe-box { width: min(560px, calc(100vw - 32px)); max-height: min(84vh, 780px); overflow-y: auto; overscroll-behavior: contain; background: var(--bg-1); }
+.rss-subscribe-box > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.rss-subscribe-box header p { margin-top: 2px; color: var(--text-2); font-size: 13px; line-height: 1.5; }
+.rss-subscribe-form { display: grid; gap: 12px; padding: 16px 22px 4px; }
+.rss-subscribe-form label { display: grid; gap: 6px; color: var(--text-1); font-size: 13px; }
+.rss-subscribe-form input { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-1); color: var(--text-0); font: inherit; }
+.rss-subscribe-form input:focus-visible, #rss-subscribe-opml:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rss-subscribe-form .ghost-btn { justify-self: start; }
+.rss-opml-section { margin-top: 16px; padding: 18px 22px 4px; border-top: 1px solid var(--border-subtle); }
+.rss-opml-section h3 { margin: 0 0 4px; color: var(--text-1); font-size: 13px; font-weight: 600; }
+.rss-subscribe-hint { margin: 0 0 10px; color: var(--text-2); font-size: 12px; line-height: 1.5; }
+#rss-subscribe-opml { box-sizing: border-box; width: 100%; min-height: 96px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-1); color: var(--text-0); font: inherit; font-size: 12px; line-height: 1.5; resize: vertical; }
+.rss-opml-actions { display: flex; gap: 8px; margin-top: 10px; }
+.rss-subscribe-status { min-height: 1.4em; margin: 12px 22px 16px; color: var(--text-2); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 
 .sidebar-footer {
   padding: 10px; border-top: 1px solid var(--border);
@@ -8504,8 +8548,6 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
   grid-template-columns: 8px minmax(0, 1fr) auto;
   gap: 10px;
   align-items: start;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 150px;
   min-height: 0;
   padding: 12px;
   border-radius: var(--radius-md);
@@ -10014,11 +10056,9 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 }
 .entry-card:focus-visible { outline: 2px solid var(--qm-accent); outline-offset: -2px; }
 
-/* Perceived speed: skip layout/paint for off-screen rows; keep their size reserved. */
-.entry-list > .entry-card {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 150px;
-}
+/* Off-screen rows used to be skipped with content-visibility:auto, but their
+   150px placeholder height made every rebuild misplace the restored scroll
+   position (j/k ratcheted the list down a card at a time). Real heights win. */
 .entry-thumb { aspect-ratio: 4 / 3; object-fit: cover; }
 
 /* Skeletons shown instantly while the first page / article body loads. */
