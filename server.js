@@ -626,7 +626,7 @@ function normalizeContributorSort(sort = '') {
 
 function contributorDirectoryMeta(req = null) {
   const sort = normalizeContributorSort(req && req.query && req.query.sort);
-  const contributors = store.getContributors({ limit: 200, sort });
+  const { contributors } = store.getContributors({ limit: 200, sort });
   const totalAssets = contributors.reduce((sum, contributor) => sum + Number(contributor.assetCount || 0), 0);
   const totalHelpful = contributors.reduce((sum, contributor) => sum + Number(contributor.helpfulCount || 0), 0);
   const latestAt = contributors.reduce((latest, contributor) => Math.max(latest, Number(contributor.latestAt) || 0), 0);
@@ -1739,7 +1739,7 @@ function renderSitemap(req) {
     }
   }
 
-  const contributors = store.getContributors({ limit: 100 });
+  const { contributors } = store.getContributors({ limit: 100 });
   if (contributors.length) {
     const latestContributorAt = contributors.reduce((latest, contributor) => Math.max(latest, Number(contributor.latestAt) || 0), 0);
     urls.push([
@@ -3112,16 +3112,72 @@ app.get('/api/podscribe/rewrite-jobs/:jobId', requireAdmin, (req, res) => {
 app.use(require('./.rss-reliability/health.cjs').middleware(fetcher, backgroundJobState));
 
 const publicApiCache = createResponseCache({ ttlMs: 10000, max: 300 });
+const assetCountsCache = new Map();
+const assetEntriesCache = new Map();
+const ASSET_ENTRY_TYPES = ['translation', 'rewrite', 'annotations', 'comments', 'chat'];
 
 // Sidebar badges: the list loads a window at a time, so its own length can only
 // say "40+". These are real totals for the same source set the list shows.
 app.get('/api/counts', (req, res) => {
   const optIn = [...new Set(String(req.query.optIn || '').split(',').filter(Boolean))];
+  const source = String(req.query.source || '').trim();
+  const category = String(req.query.category || '').trim();
   res.setHeader('Cache-Control', 'private, no-cache');
   res.json(fetcher.countEntries({
+    sourceId: source || undefined,
+    category: category || undefined,
     allowedOptInSourceIds: new Set(optIn),
     userId: req.user ? req.user.id : '',
   }));
+});
+
+app.get('/api/asset-counts', (req, res) => {
+  const optIn = [...new Set(String(req.query.optIn || '').split(',').filter(Boolean))].sort();
+  const source = String(req.query.source || '').trim();
+  const category = String(req.query.category || '').trim();
+  const key = JSON.stringify([source, category, optIn]);
+  const cached = assetCountsCache.get(key);
+  res.setHeader('Cache-Control', 'private, no-cache');
+  if (cached && cached.until > Date.now()) return res.json(cached.value);
+  const value = fetcher.getAssetTotals({
+    sourceId: source || undefined,
+    category: category || undefined,
+    allowedOptInSourceIds: new Set(optIn),
+  });
+  if (assetCountsCache.size >= 100) assetCountsCache.delete(assetCountsCache.keys().next().value);
+  assetCountsCache.set(key, { value, until: Date.now() + 60000 });
+  res.json(value);
+});
+
+// 资产视图的列表内容。和 /api/asset-counts 一样先按 scope 全量筛，再分页，
+// 这样列表内容与统计数字同源，而不是从最近窗口里过滤出 0 条。
+app.get('/api/assets', (req, res) => {
+  const optIn = [...new Set(String(req.query.optIn || '').split(',').filter(Boolean))].sort();
+  const source = String(req.query.source || '').trim();
+  const category = String(req.query.category || '').trim();
+  const q = String(req.query.q || '').slice(0, 100);
+  const type = ASSET_ENTRY_TYPES.includes(req.query.type) ? req.query.type : '';
+  const sort = req.query.sort === 'helpful' ? 'helpful' : 'latest';
+  const limit = Math.max(1, Math.min(1000, Number.parseInt(req.query.limit, 10) || 400));
+  const offset = Math.max(0, Number.parseInt(req.query.offset, 10) || 0);
+  const key = JSON.stringify([source, category, optIn, q, type, sort, limit, offset]);
+  const cached = assetEntriesCache.get(key);
+  res.setHeader('Cache-Control', 'private, no-cache');
+  if (cached && cached.until > Date.now()) return res.json(cached.value);
+  const result = fetcher.getAssetEntries({
+    sourceId: source || undefined,
+    category: category || undefined,
+    allowedOptInSourceIds: new Set(optIn),
+    q: q || undefined,
+    type,
+    sort,
+    limit,
+    offset,
+  });
+  const value = { entries: result.entries.map(mediaListEntry), total: result.total, totalAssets: result.totalAssets, byType: result.byType };
+  if (assetEntriesCache.size >= 100) assetEntriesCache.delete(assetEntriesCache.keys().next().value);
+  assetEntriesCache.set(key, { value, until: Date.now() + 60000 });
+  res.json(value);
 });
 
 app.get('/api/sources', (req, res) => {
@@ -3281,6 +3337,16 @@ app.get('/api/me/entry-states', requireLogin, (req, res) => {
   res.json({ states: store.getUserEntryStates(req.user.id) });
 });
 
+app.get('/api/me/starred-entries', requireLogin, (req, res) => {
+  const limit = Math.max(1, Math.min(2000, Number.parseInt(req.query.limit, 10) || 2000));
+  res.json({ entries: fetcher.getUserStarredEntries({ userId: req.user.id, limit, viewer: req.user }) });
+});
+
+app.get('/api/me/history-entries', requireLogin, (req, res) => {
+  const limit = Math.max(1, Math.min(2000, Number.parseInt(req.query.limit, 10) || 2000));
+  res.json({ entries: fetcher.getUserHistoryEntries({ userId: req.user.id, limit, viewer: req.user }) });
+});
+
 app.get('/api/me/comments', requireLogin, (req, res) => {
   const limit = Math.max(1, Math.min(200, Number.parseInt(req.query.limit, 10) || 100));
   res.json({ comments: store.getUserComments(req.user.id, { limit }) });
@@ -3309,7 +3375,8 @@ app.get('/api/me/chat-messages', requireLogin, (req, res) => {
 app.get('/api/contributors', (req, res) => {
   const limit = Math.max(1, Math.min(200, Number.parseInt(req.query.limit, 10) || 100));
   const sort = normalizeContributorSort(req.query.sort);
-  res.json({ contributors: store.getContributors({ limit, sort }), sort });
+  const { contributors, total } = store.getContributors({ limit, sort });
+  res.json({ contributors, total, sort });
 });
 
 app.get('/api/admin/submission-users', requireAdmin, (req, res) => {
@@ -3576,8 +3643,8 @@ app.get('/api/entries', (req, res) => {
   const parsedLimit = limit ? Math.min(1000, Math.max(1, parseInt(limit, 10) || 0)) || undefined : undefined;
   const key = JSON.stringify(['entries', sort, source || '', category || '', String(q || '').slice(0, 100), parsedLimit || '', optIn, ready === 'rewrite', compact, summary]);
   // The shared list is cached for a few seconds; only the viewer's own reaction is added per request.
-  const shared = publicApiCache.get(key, () => ({
-    entries: fetcher.getEntries({
+  const shared = publicApiCache.get(key, () => {
+    const result = fetcher.getEntries({
       sourceId: source || undefined,
       category: category || undefined,
       q: q ? String(q).slice(0, 100) : undefined,
@@ -3587,15 +3654,20 @@ app.get('/api/entries', (req, res) => {
       compact: compact || summary === 'compact', minimal: compact || summary === 'minimal',
       allowedOptInSourceIds: new Set(optIn),
       requireRewrite: ready === 'rewrite',
-    }).map(entry => compact ? compactEntry(mediaListEntry(entry)) : mediaListEntry(entry)),
-  }));
+      withTotal: true,
+    });
+    return {
+      entries: result.entries.map(entry => compact ? compactEntry(mediaListEntry(entry)) : mediaListEntry(entry)),
+      total: result.total,
+    };
+  });
   if (!req.user) return sendCached(req, res, shared, { shared: true, maxAge: 3, sMaxAge: 10, swr: 30 });
   const mine = store.getViewerReactions(shared.payload.entries.map(entry => entry.id), req.user.id);
   const entries = shared.payload.entries.map(entry => (
     mine[entry.id] && entry.stats ? { ...entry, stats: { ...entry.stats, reactionByMe: mine[entry.id] } } : entry
   ));
   res.setHeader('Cache-Control', 'private, no-cache');
-  return res.json({ entries });
+  return res.json({ entries, total: shared.payload.total });
 });
 
 app.get('/api/sources/:id/entries', (req, res) => {
