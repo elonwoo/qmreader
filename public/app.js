@@ -642,13 +642,12 @@ function normalizeHistory(raw) {
     const viewedAt = Number(item && (item.viewedAt || item.at)) || Date.now();
     map.set(entryId, viewedAt);
   }
-  return new Map([...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 1000));
+  return new Map([...map.entries()].sort((a, b) => b[1] - a[1]));
 }
 
 function historyEntriesForStorage(map) {
   return [...(map || new Map()).entries()]
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 1000)
     .map(([entryId, viewedAt]) => ({ entryId, viewedAt }));
 }
 
@@ -664,7 +663,14 @@ const state = {
   entryListLimit: ENTRY_LIST_PAGE_SIZE,
   entryListHasMore: false,
   entriesLoadingMore: false,
+  entryListTotal: 0,
+  entryListSource: 'api',
   counts: null,
+  scopeCounts: null,
+  assetCounts: null,
+  assetListCounts: null,
+  homeAssets: null,
+  contributorTotal: 0,
   contributors: [],
   adminSubmissionUsers: [],
   adminSubmissionRequests: [],
@@ -1899,11 +1905,29 @@ function entryListScopeKey() {
   return [state.view, state.filterSource || '', state.filterCategory || '', state.q || '', [...state.optInSources].sort().join(',')].join('|');
 }
 
+// 资产视图的查询参数：全量资产接口和它的分页共用同一份 scope。
+function assetListParams({ limit = 400, offset = 0 } = {}) {
+  const p = new URLSearchParams();
+  if (state.optInSources.size) p.set('optIn', [...state.optInSources].join(','));
+  if (state.filterSource) p.set('source', state.filterSource);
+  if (state.filterCategory) p.set('category', state.filterCategory);
+  if (state.assetFilter) p.set('type', state.assetFilter);
+  if (state.q) p.set('q', state.q);
+  p.set('sort', state.assetSort);
+  p.set('limit', String(limit));
+  if (offset) p.set('offset', String(offset));
+  return p;
+}
+
 async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.view === 'hot' ? 'compact' : 'minimal', growWindow = false, retryOnStartup = false } = {}) {
   const scopeKey = entryListScopeKey();
   if (scopeKey !== state.entryListScope) {
     state.entryListScope = scopeKey;
     state.entryListLimit = ENTRY_LIST_PAGE_SIZE;
+    state.entryListTotal = 0;
+    state.scopeCounts = null;
+    state.assetListCounts = null;
+    state.homeAssets = null;
   } else if (growWindow && entryListWindowed()) {
     state.entryListLimit += ENTRY_LIST_PAGE_SIZE;
   }
@@ -1916,11 +1940,21 @@ async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.
   const limit = entryListWindowed() ? state.entryListLimit : 400;
   p.set('limit', String(limit));
   if (summary !== 'full') p.set('summary', summary);
+  // 收藏 / 历史由专属接口一次返回全量条目，和列表头的数字同源。
+  const meEntriesUrl = !state.q && state.view === 'starred'
+    ? '/api/me/starred-entries?limit=2000'
+    : !state.q && state.view === 'history'
+    ? '/api/me/history-entries?limit=2000'
+    : '';
+  // 资产视图走全量资产接口：总数和列表都来自同一个 scope，避免窗口过滤出 0 条。
+  const assetsUrl = state.view === 'assets' ? `/api/assets?${assetListParams().toString()}` : '';
   if (entriesAbortController) entriesAbortController.abort();
   const controller = new AbortController();
   entriesAbortController = controller;
   const seq = ++entriesRequestSeq;
   let data;
+  let usedMe = false;
+  let usedAssets = false;
   try {
     const bootstrap = document.getElementById('qm-reader-bootstrap');
     // Consume at most once, only for the exact default public list. All other
@@ -1936,16 +1970,27 @@ async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.
       }
     }
     if (!data) {
-      const url = '/api/entries?' + p.toString();
+      const entriesUrl = '/api/entries?' + p.toString();
+      const useMeEntries = Boolean(meEntriesUrl);
+      const useAssets = Boolean(assetsUrl);
       const options = { signal: controller.signal };
       try {
-        data = await api(url, options);
+        data = await api(useAssets ? assetsUrl : useMeEntries ? meEntriesUrl : entriesUrl, options);
+        usedMe = useMeEntries;
+        usedAssets = useAssets;
       } catch (error) {
-        const transient = error instanceof TypeError || [408, 502, 503, 504].includes(error.status);
-        if (!retryOnStartup || !transient) throw error;
-        await new Promise(resolve => setTimeout(resolve, 750));
-        if (controller.signal.aborted || scopeKey !== entryListScopeKey()) return false;
-        data = await api(url, options);
+        if (useAssets || useMeEntries) {
+          // 专属接口异常时退回通用列表，保持原有行为。
+          data = await api(entriesUrl, options);
+          usedMe = false;
+          usedAssets = false;
+        } else {
+          const transient = error instanceof TypeError || [408, 502, 503, 504].includes(error.status);
+          if (!retryOnStartup || !transient) throw error;
+          await new Promise(resolve => setTimeout(resolve, 750));
+          if (controller.signal.aborted || scopeKey !== entryListScopeKey()) return false;
+          data = await api(entriesUrl, options);
+        }
       }
     }
   } catch (err) {
@@ -1955,7 +2000,19 @@ async function loadEntries({ summary = state.view === 'assets' ? 'full' : state.
   if (seq !== entriesRequestSeq) return false;
   state.entries = data.entries.filter(entry => !/^(wechat-|podscribe-)/.test(String(entry.sourceId || '')) || state.optInSources.has(entry.sourceId));
   state.entryRenderLimit = ENTRY_RENDER_BATCH_SIZE;
-  state.entryListHasMore = entryListWindowed() && Array.isArray(data.entries) && data.entries.length >= limit;
+  state.entryListSource = usedMe ? 'me' : usedAssets ? 'assets' : 'api';
+  state.entryListTotal = Number(data.total) || 0;
+  state.assetListCounts = usedAssets
+    ? { totalAssets: Number(data.totalAssets) || 0, byType: data.byType || {} }
+    : null;
+  // 资产接口返回真值总数，用它判断还有没有下一批；其它视图沿用窗口满页判断。
+  state.entryListHasMore = usedAssets
+    ? state.entries.length < state.entryListTotal
+    : entryListWindowed() && Array.isArray(data.entries) && data.entries.length >= limit;
+  // scope 变化后补一次真值；不阻塞列表渲染。
+  void refreshScopeCounts();
+  if (state.view === 'assets' || isHomeScope()) void refreshAssetCounts();
+  if (isHomeScope()) void refreshHomeAssets();
   return true;
 }
 
@@ -1965,10 +2022,76 @@ async function refreshEntryCounts() {
     const p = new URLSearchParams();
     if (state.optInSources.size) p.set('optIn', [...state.optInSources].join(','));
     const data = await api(`/api/counts${p.toString() ? `?${p}` : ''}`);
-    state.counts = { unread: Number(data.unread) || 0, bySource: data.bySource || {} };
+    state.counts = { all: Number(data.all) || 0, unread: Number(data.unread) || 0, hot: Number(data.hot) || 0, bySource: data.bySource || {}, bySourceAll: data.bySourceAll || {} };
     renderSidebar();
+    // The header must agree with the sidebar badges, not with the loaded window.
+    updateListScopeCount(visibleEntries());
   } catch {
     // 计数拿不到就退回窗口内统计，不影响读文章。
+  }
+}
+
+// 当前筛选范围（源 / 分类 / optIn）的全量计数，列表头与热门徽标优先用它。
+async function refreshScopeCounts() {
+  const scopeKey = entryListScopeKey();
+  try {
+    const p = new URLSearchParams();
+    if (state.optInSources.size) p.set('optIn', [...state.optInSources].join(','));
+    if (state.filterSource) p.set('source', state.filterSource);
+    if (state.filterCategory) p.set('category', state.filterCategory);
+    const data = await api(`/api/counts${p.toString() ? `?${p}` : ''}`);
+    if (scopeKey !== entryListScopeKey()) return;
+    state.scopeCounts = { all: Number(data.all) || 0, unread: Number(data.unread) || 0, hot: Number(data.hot) || 0 };
+    renderSidebar();
+    updateListScopeCount(visibleEntries());
+  } catch {
+    // 拿不到 scope 真值就保留上一次的结果，缺失时回退全局 counts。
+  }
+}
+
+// 公开资产的全量计数；数据未到时各视图先显示已加载窗口的统计。
+async function refreshAssetCounts() {
+  const scopeKey = entryListScopeKey();
+  try {
+    const p = new URLSearchParams();
+    if (state.optInSources.size) p.set('optIn', [...state.optInSources].join(','));
+    if (state.filterSource) p.set('source', state.filterSource);
+    if (state.filterCategory) p.set('category', state.filterCategory);
+    const data = await api(`/api/asset-counts${p.toString() ? `?${p}` : ''}`);
+    if (scopeKey !== entryListScopeKey()) return;
+    state.assetCounts = {
+      totalAssets: Number(data.totalAssets) || 0,
+      entries: Number(data.entries) || 0,
+      helpfulTotal: Number(data.helpfulTotal) || 0,
+      byType: data.byType || {},
+    };
+    renderEntryPaneTabs();
+    renderAssetActivityStrip();
+    if (isHomeScope() && state.homeTab === 'assets') renderList();
+    else updateListScopeCount(visibleEntries());
+  } catch {
+    // 资产计数拿不到就继续用窗口统计。
+  }
+}
+
+// 首页「公开资产动态」：列表内容同样问全量资产接口，避免窗口里筛出 0 条。
+async function refreshHomeAssets() {
+  if (!isHomeScope()) return;
+  const scopeKey = entryListScopeKey();
+  try {
+    const p = new URLSearchParams({ limit: '30', sort: 'latest' });
+    if (state.optInSources.size) p.set('optIn', [...state.optInSources].join(','));
+    const data = await api(`/api/assets?${p.toString()}`);
+    if (scopeKey !== entryListScopeKey()) return;
+    state.homeAssets = {
+      entries: Array.isArray(data.entries) ? data.entries : [],
+      total: Number(data.total) || 0,
+    };
+    renderEntryPaneTabs();
+    if (isHomeScope() && state.homeTab === 'assets') renderList();
+  } catch {
+    // 拿不到就回退到已加载窗口的资产动态。
+    state.homeAssets = null;
   }
 }
 
@@ -1986,8 +2109,35 @@ function restoreEntryListScroll() {
   requestAnimationFrame(() => { el.scrollTop = saved; });
 }
 
+async function loadMoreAssetEntries() {
+  state.entriesLoadingMore = true;
+  const el = $('#entry-list');
+  const scrollTop = el ? el.scrollTop : 0;
+  try {
+    const data = await api('/api/assets?' + assetListParams({ offset: state.entries.length }).toString());
+    const known = new Set(state.entries.map(entry => entry.id));
+    const fresh = (data.entries || []).filter(entry => !known.has(entry.id));
+    state.entryListTotal = Number(data.total) || state.entryListTotal;
+    state.assetListCounts = data.byType || data.totalAssets
+      ? { totalAssets: Number(data.totalAssets) || 0, byType: data.byType || {} }
+      : state.assetListCounts;
+    state.entries = state.entries.concat(fresh);
+    state.entryListHasMore = state.entries.length < state.entryListTotal;
+    state.entryRenderLimit = state.entries.length;
+    state.entriesLoadingMore = false;
+    renderList();
+    renderSidebar();
+    if (el) requestAnimationFrame(() => { el.scrollTop = scrollTop; });
+  } catch (err) {
+    state.entriesLoadingMore = false;
+    renderList();
+    toast('加载更多资产失败：' + err.message, 4000);
+  }
+}
+
 async function loadMoreEntries() {
   if (state.entriesLoadingMore || !state.entryListHasMore) return;
+  if (state.entryListSource === 'assets') return loadMoreAssetEntries();
   state.entriesLoadingMore = true;
   const el = $('#entry-list');
   const scrollTop = el ? el.scrollTop : 0;
@@ -2013,6 +2163,7 @@ async function loadContributors() {
   if (state.contributorSort !== 'latest') p.set('sort', state.contributorSort);
   const data = await api('/api/contributors?' + p.toString());
   state.contributors = data.contributors || [];
+  state.contributorTotal = Number(data.total) || state.contributors.length;
 }
 
 function applyGuestEntryStates() {
@@ -2103,10 +2254,6 @@ function qScoreParts(entry) {
   return { ...q, parts };
 }
 
-function hotEntryCount(entries = state.entries) {
-  return entries.filter(entry => entryQualityScore(entry) > 0.4).length;
-}
-
 function mergeEntryStats(entryId, stats = {}, { rerenderList = true } = {}) {
   const id = String(entryId || stats.entryId || '').trim();
   if (!id) return;
@@ -2179,7 +2326,152 @@ function renderEntryStateUi() {
   if (state.activeEntry) renderReaderStatsUi();
 }
 
-async function syncEntryState(entryId, patch) {
+// Opening an article only flips one card to read. Rebuilding the list and the
+// sidebar (and with them every favicon) for that made the whole rail flash, so
+// the hot path updates the few affected nodes in place instead.
+function sidebarGroupSources(group) {
+  if (group === 'rss') return state.sources.filter(s => s.customRss && s.enabled);
+  if (group === 'wechat') return state.sources.filter(s => s.optIn && s.enabled && s.id.startsWith('wechat-'));
+  return state.sources.filter(s => !s.customRss && s.enabled && s.category === group && (!s.optIn || (s.category === 'podcast' && state.optInSources.has(s.id))));
+}
+
+// 热门徽标用 scope 真值，缺失时回退全局热榜总数；不再用加载窗口冒充。
+function hotBadgeCount() {
+  const scope = state.scopeCounts;
+  if (scope && Number.isFinite(Number(scope.hot))) return Number(scope.hot);
+  const counts = state.counts;
+  return counts && Number.isFinite(Number(counts.hot)) ? Number(counts.hot) : 0;
+}
+
+function refreshSidebarCounts() {
+  document.querySelectorAll('#feed-groups [data-source-id]').forEach(row => {
+    const count = row.querySelector('.fcount');
+    if (count) count.textContent = sourceUnreadLabel(row.dataset.sourceId) || '';
+  });
+  document.querySelectorAll('#feed-groups [data-group]').forEach(label => {
+    const count = label.querySelector('.group-count');
+    if (count) count.textContent = groupUnreadLabel(sidebarGroupSources(label.dataset.group)) || '';
+  });
+  const hotCount = hotBadgeCount();
+  $('#count-all').textContent = '';
+  $('#count-hot').textContent = hotCount ? String(hotCount) : '';
+  $('#count-unread').textContent = state.counts && state.counts.unread ? String(state.counts.unread) : '';
+  $('#count-starred').textContent = state.starred.size || '';
+  $('#count-history').textContent = state.history.size || '';
+  $('#count-contributors').textContent = state.contributorTotal || state.contributors.length || '';
+}
+
+function revealEntryCardAtTop(entryId) {
+  if (state.revealEntryId !== entryId || Date.now() >= state.revealUntil) return;
+  const list = $('#entry-list');
+  const card = list && list.querySelector(`:scope > .entry-card[data-id="${CSS.escape(entryId)}"]`);
+  if (!card) return;
+  const offset = card.getBoundingClientRect().top - list.getBoundingClientRect().top;
+  list.scrollTop = Math.max(0, list.scrollTop + offset - 12);
+  // 增量路径不重建列表，焦点得手动跟着当前文章走。
+  card.focus({ preventScroll: true });
+}
+
+// The list header reports server totals for the current scope, so it matches the
+// sidebar badge instead of counting the window that happens to be loaded. Search
+// and the local-only views (starred, history, assets) keep the window statistic
+// because the server totals do not describe them.
+function entryScopeCounts(windowCount, windowUnread) {
+  // 搜索：/api/entries 的 total 是当前 scope 的全量命中数。
+  if (state.q) return { count: Number(state.entryListTotal) || windowCount, unread: windowUnread };
+  // 收藏 / 历史：专属接口一次返回全量，列表头与列表内容同源。
+  if (state.view === 'starred' || state.view === 'history') {
+    return { count: state.entryListSource === 'me' ? state.entries.length : windowCount, unread: windowUnread };
+  }
+  // 资产视图：/api/assets 的 total 与列表内容同源。
+  if (state.view === 'assets') {
+    return { count: state.entryListSource === 'assets' ? Number(state.entryListTotal) || windowCount : windowCount, unread: windowUnread };
+  }
+  const scope = state.scopeCounts;
+  if (scope) {
+    if (state.view === 'hot') return { count: Number(scope.hot) || 0, unread: Number(scope.unread) || 0 };
+    if (state.view === 'unread') {
+      const unread = Number(scope.unread) || windowUnread;
+      return { count: unread, unread };
+    }
+    if (state.view === 'all' || state.filterSource || state.filterCategory) {
+      return { count: Number(scope.all) || 0, unread: Number(scope.unread) || 0 };
+    }
+  }
+  const counts = state.counts;
+  if (!counts || !counts.bySourceAll) return { count: windowCount, unread: windowUnread };
+  const totalsFor = ids => ({
+    count: ids.reduce((sum, id) => sum + (Number(counts.bySourceAll[id]) || 0), 0),
+    unread: ids.reduce((sum, id) => sum + (Number(counts.bySource[id]) || 0), 0),
+  });
+  if (state.filterSource) return totalsFor([state.filterSource]);
+  if (state.filterCategory) return totalsFor(sidebarGroupSources(state.filterCategory).map(source => source.id));
+  if (state.view === 'unread') return { count: Number(counts.unread) || windowUnread, unread: Number(counts.unread) || windowUnread };
+  if (state.view === 'hot') return { count: Number(counts.hot) || 0, unread: Number(counts.unread) || 0 };
+  if (state.view === 'all') return { count: Number(counts.all) || 0, unread: Number(counts.unread) || 0 };
+  return { count: windowCount, unread: windowUnread };
+}
+
+function updateListScopeCount(list) {
+  const meta = $('#list-scope-count');
+  if (!meta) return;
+  const windowUnread = list.filter(entry => !state.read.has(entry.id)).length;
+  const { count, unread } = entryScopeCounts(list.length, windowUnread);
+  // 热门与搜索的「篇数」和未读分母不是同一口径，只报篇数。
+  if (state.view === 'hot' || state.q) meta.textContent = `${count} 篇`;
+  else if (state.view === 'assets') meta.textContent = `${count} 篇文章`;
+  else if (state.view === 'unread') meta.textContent = `${unread} 篇未读`;
+  else meta.textContent = `${count} 篇 · ${unread} 未读`;
+}
+
+let countsRefreshTimer = null;
+
+// 打开的瞬间先把未读减掉，侧栏和列表头立刻跟着动；服务端真值稍后校准。
+function adjustUnreadCounts(sourceId) {
+  const counts = state.counts;
+  if (counts && Number.isFinite(Number(counts.unread))) {
+    counts.unread = Math.max(0, Number(counts.unread) - 1);
+    if (counts.bySource && Number.isFinite(Number(counts.bySource[sourceId]))) {
+      counts.bySource[sourceId] = Math.max(0, Number(counts.bySource[sourceId]) - 1);
+    }
+  }
+  const scope = state.scopeCounts;
+  if (scope && Number.isFinite(Number(scope.unread)) && (!state.filterSource || state.filterSource === sourceId)) {
+    scope.unread = Math.max(0, Number(scope.unread) - 1);
+  }
+  refreshSidebarCounts();
+  updateListScopeCount(visibleEntries());
+}
+
+// j/k 连按时不逐个请求；停手后拉一次服务端真值，覆盖任何本地漂移。
+function scheduleCountRefresh() {
+  clearTimeout(countsRefreshTimer);
+  countsRefreshTimer = setTimeout(() => {
+    void refreshEntryCounts();
+    if (state.filterSource || state.filterCategory) void refreshScopeCounts();
+  }, 600);
+}
+
+function refreshEntryReadState(entryId) {
+  if (state.view === 'unread') {
+    // Read rows drop out of this view, so the list itself still has to re-render.
+    renderList();
+  } else {
+    document.querySelectorAll('#entry-list > .entry-card').forEach(card => {
+      card.classList.toggle('active', card.dataset.id === entryId);
+      if (card.dataset.id === entryId) card.classList.add('read');
+    });
+    const scopeEntries = visibleEntries();
+    updateListScopeCount(scopeEntries);
+    // The unread branch above re-renders through renderList, which already pins
+    // the j/k target; the incremental path must do the same scroll itself.
+    revealEntryCardAtTop(entryId);
+  }
+  refreshSidebarCounts();
+  if (state.activeEntry) renderReaderStatsUi();
+}
+
+async function syncEntryState(entryId, patch, { rerenderList = true } = {}) {
   if (!state.me) {
     persist();
     return null;
@@ -2190,7 +2482,7 @@ async function syncEntryState(entryId, patch) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ entryId, ...patch }),
     });
-    if (data.stats) mergeEntryStats(entryId, data.stats);
+    if (data.stats) mergeEntryStats(entryId, data.stats, { rerenderList });
     return data;
   } catch (err) {
     toast('同步阅读状态失败: ' + err.message, 4000);
@@ -2206,7 +2498,7 @@ function recordEntryView(entryId) {
   state.history = new Map(historyEntriesForStorage(state.history).map(item => [item.entryId, item.viewedAt]));
   api(`/api/entry/${encodeURIComponent(id)}/view`, { method: 'POST' })
     .then(data => {
-      if (data && data.stats) mergeEntryStats(id, data.stats);
+      if (data && data.stats) mergeEntryStats(id, data.stats, { rerenderList: false });
     })
     .catch(() => {});
 }
@@ -2239,13 +2531,6 @@ async function loadMe() {
 /* ---------- Sidebar ---------- */
 function unreadCountFor(pred) {
   return state.entries.filter(e => pred(e) && !state.read.has(e.id)).length;
-}
-
-// 列表按窗口加载（60/120/…），hasMore 时计数只是窗口内统计，用 n+ 表达而非伪装成全量
-function entryWindowCountLabel(count) {
-  const n = Number(count) || 0;
-  if (!n) return '';
-  return state.entryListHasMore ? `${n}+` : String(n);
 }
 
 function entryBelongsToSource(entry, sourceId) {
@@ -2373,6 +2658,7 @@ function renderSidebar() {
   const rssLabel = document.createElement('div');
   rssLabel.className = 'group-label wechat-group-label';
   rssLabel.textContent = '我的订阅';
+  rssLabel.dataset.group = 'rss';
   const rssAdd = document.createElement('button');
   rssAdd.type = 'button';
   rssAdd.className = 'wechat-add-btn';
@@ -2396,6 +2682,7 @@ function renderSidebar() {
       for (const s of customRssSources) {
         const row = document.createElement('div');
         row.className = 'feed-item rss-feed-item' + (state.filterSource === s.id ? ' active' : '');
+        row.dataset.sourceId = s.id;
         row.setAttribute('role', 'button');
         row.tabIndex = 0;
         const unread = sourceUnreadLabel(s.id);
@@ -2432,6 +2719,7 @@ function renderSidebar() {
     const label = document.createElement('div');
     label.className = 'group-label';
     label.textContent = CATEGORY_LABELS[cat];
+    label.dataset.group = cat;
     label.appendChild(groupCountNode(groupUnreadLabel(list)));
     label.style.cursor = 'pointer';
     label.title = `查看全部${CATEGORY_LABELS[cat]}`;
@@ -2456,6 +2744,7 @@ function renderSidebar() {
     for (const s of list) {
       const btn = document.createElement('button');
       btn.className = 'feed-item' + (state.filterSource === s.id ? ' active' : '');
+      btn.dataset.sourceId = s.id;
       const unread = sourceUnreadLabel(s.id);
       btn.innerHTML = `${faviconHtml(s.siteUrl, s.name)}
         <span class="fname" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}${s.id.startsWith('podscribe-') ? ' · 文稿' : ''}</span>
@@ -2472,6 +2761,7 @@ function renderSidebar() {
     const label = document.createElement('div');
     label.className = 'group-label wechat-group-label';
     label.textContent = '微信公众号';
+    label.dataset.group = 'wechat';
     label.appendChild(groupCountNode(groupUnreadLabel(wechatSources)));
     const add = document.createElement('button');
     add.type = 'button';
@@ -2488,6 +2778,7 @@ function renderSidebar() {
     for (const s of visibleWechat) {
       const btn = document.createElement('button');
       btn.className = 'feed-item' + (state.filterSource === s.id ? ' active' : '');
+      btn.dataset.sourceId = s.id;
       const unread = sourceUnreadLabel(s.id);
       btn.innerHTML = `${faviconHtml(s.siteUrl, s.name)}<span class="fname">${escapeHtml(s.name)}</span><span class="fcount">${unread || ''}</span>`;
       btn.onclick = () => selectSource(s.id);
@@ -2497,12 +2788,13 @@ function renderSidebar() {
   }
 
   // 「全部」不显示数字：库里的总量没有阅读上的意义，未读才值得看。
+  const hotCount = hotBadgeCount();
   $('#count-all').textContent = '';
-  $('#count-hot').textContent = entryWindowCountLabel(hotEntryCount());
-  $('#count-unread').textContent = state.counts ? (state.counts.unread ? String(state.counts.unread) : '') : entryWindowCountLabel(unreadCountFor(() => true));
+  $('#count-hot').textContent = hotCount ? String(hotCount) : '';
+  $('#count-unread').textContent = state.counts && state.counts.unread ? String(state.counts.unread) : '';
   $('#count-starred').textContent = state.starred.size || '';
   $('#count-history').textContent = state.history.size || '';
-  $('#count-contributors').textContent = state.contributors.length || '';
+  $('#count-contributors').textContent = state.contributorTotal || state.contributors.length || '';
   renderAssetDashboard();
   renderSidebarMore();
   syncMobileTabbar(); // UI-MOBILE
@@ -2942,6 +3234,83 @@ function entryRewriteStatus(entry = state.activeEntry) {
   if (raw === 'failed' || raw === 'error' || raw === 'skipped') return 'failed';
   if (raw === 'pending' || raw === 'running' || raw === 'retry') return 'pending';
   return 'missing';
+}
+
+// Update one card's status badge without rebuilding the whole list, so
+// background asset loads don't flash every row's icon.
+function refreshEntryCardBadges(entryId) {
+  if (state.view === 'assets' || state.view === 'contributors') { renderList(); return; }
+  const entry = state.entries.find(item => item.id === entryId);
+  const card = document.querySelector(`#entry-list > .entry-card[data-id="${CSS.escape(entryId)}"]`);
+  if (!entry || !card) return;
+  const kicker = card.querySelector('.entry-kicker');
+  if (!kicker) return;
+  kicker.querySelector('.entry-rewrite-status')?.remove();
+  const html = rewriteStatusBadgeHtml(entry);
+  if (!html) return;
+  const star = kicker.querySelector('.entry-star');
+  if (star) star.insertAdjacentHTML('beforebegin', html);
+  else kicker.insertAdjacentHTML('beforeend', html);
+}
+
+// Starring an article changes one card's badge, the sidebar count, and — only
+// in the starred view — the list membership. Update those in place instead of
+// rebuilding the whole list and sidebar for a single keystroke.
+function refreshEntryStarState(entryId) {
+  if (state.view === 'starred' || state.view === 'assets' || state.view === 'contributors') {
+    renderList();
+  } else {
+    const card = document.querySelector(`#entry-list > .entry-card[data-id="${CSS.escape(entryId)}"]`);
+    const kicker = card && card.querySelector('.entry-kicker');
+    if (kicker) {
+      const star = kicker.querySelector('.entry-star');
+      if (state.starred.has(entryId)) {
+        if (!star) kicker.insertAdjacentHTML('beforeend', `<span class="entry-star">${lucideIcon('star')}</span>`);
+      } else if (star) {
+        star.remove();
+      }
+    }
+  }
+  $('#count-starred').textContent = state.starred.size || '';
+  if (state.activeEntry?.id === entryId) renderReaderStatsUi();
+}
+
+// Update one card's title/summary/badge in place after the server returns a
+// fresher version of the entry, without rebuilding the list around it.
+function refreshEntryCardContent(entryId) {
+  if (state.view === 'assets' || state.view === 'contributors') { renderList(); return; }
+  const entry = state.entries.find(item => item.id === entryId) || (state.activeEntry?.id === entryId ? state.activeEntry : null);
+  const card = document.querySelector(`#entry-list > .entry-card[data-id="${CSS.escape(entryId)}"]`);
+  if (!entry || !card) return;
+  const title = card.querySelector('.entry-title');
+  if (title) title.textContent = entry.titleZh || entry.title || '';
+  card.setAttribute('aria-label', entry.titleZh || entry.title || '打开文章');
+  const originalTitle = originalTitleOf(entry);
+  let original = card.querySelector('.entry-original');
+  if (originalTitle) {
+    if (!original) {
+      original = document.createElement('div');
+      original.className = 'entry-original';
+      original.lang = 'en';
+      title?.insertAdjacentElement('afterend', original);
+    }
+    original.textContent = originalTitle;
+  } else if (original) {
+    original.remove();
+  }
+  const summaryText = entryCardSummary(entry);
+  let summary = card.querySelector('.entry-summary');
+  if (summaryText) {
+    if (!summary) {
+      summary = document.createElement('div');
+      summary.className = 'entry-summary';
+      (card.querySelector('.entry-original') || title)?.insertAdjacentElement('afterend', summary);
+    }
+    summary.textContent = summaryText;
+  } else if (summary) {
+    summary.remove();
+  }
+  refreshEntryCardBadges(entryId);
 }
 
 function rewriteStatusBadgeHtml(entry) {
@@ -3455,8 +3824,8 @@ function entryPrimaryAssetType(entry) {
   return ASSET_FILTER_TYPES.find(type => entryHasAssetType(entry, type)) || '';
 }
 
-function latestAssetActivity(limit = 4) {
-  return state.entries
+function latestAssetActivity(limit = 4, entries = state.entries) {
+  return entries
     .filter(entry => hasEntryAssets(entry) && Number(entry.assets?.latestAt || 0) > 0)
     .slice()
     .sort((a, b) => {
@@ -3487,7 +3856,8 @@ function isHomeScope() {
 }
 
 function homeAssetActivityItems(limit = 24) {
-  return latestAssetActivity(limit).filter(item => item.type);
+  const entries = state.homeAssets && Array.isArray(state.homeAssets.entries) ? state.homeAssets.entries : state.entries;
+  return latestAssetActivity(limit, entries).filter(item => item.type);
 }
 
 function renderEntryPaneTabs() {
@@ -3496,9 +3866,12 @@ function renderEntryPaneTabs() {
   const show = isHomeScope() && state.entries.length > 0;
   tabs.classList.toggle('hidden', !show);
   if (!show) return;
-  const assetCount = homeAssetActivityItems(1000).length;
-  $('#home-entry-count').textContent = entryWindowCountLabel(state.entries.length);
-  $('#home-asset-count').textContent = assetCount;
+  const assetCount = state.homeAssets
+    ? Number(state.homeAssets.total) || 0
+    : state.assetCounts ? state.assetCounts.totalAssets : homeAssetActivityItems(1000).length;
+  const entryTotal = state.counts ? state.counts.all : state.scopeCounts ? state.scopeCounts.all : null;
+  $('#home-entry-count').textContent = entryTotal == null ? '' : String(entryTotal);
+  $('#home-asset-count').textContent = assetCount ? String(assetCount) : '';
   $$('#entry-pane-tabs [data-home-tab]').forEach(btn => {
     const active = btn.dataset.homeTab === state.homeTab;
     btn.classList.toggle('active', active);
@@ -3576,12 +3949,19 @@ function renderHomeAssetActivityList(el) {
     return;
   }
   const { totalAssets, entries, helpfulTotal } = assetDashboardStats();
+  // 有服务端全量计数时用它；搜索 / 数据未到先显示已加载窗口的统计。
+  const live = state.assetCounts && !state.q ? state.assetCounts : null;
+  const heroTotalAssets = live
+    ? (state.assetFilter ? Number(live.byType[state.assetFilter]) || 0 : live.totalAssets)
+    : totalAssets;
+  const heroEntries = state.homeAssets ? Number(state.homeAssets.total) || 0 : live ? live.entries : entries.length;
+  const heroHelpful = live ? live.helpfulTotal : helpfulTotal;
   el.innerHTML = `
     <div class="home-asset-hero">
       <div>
         <span>公开资产动态</span>
-        <strong>${totalAssets} 条资产 · ${entries.length} 篇文章</strong>
-        <em>${helpfulTotal ? `读者标记有用 ${helpfulTotal} 次` : '按最新沉淀排序'}</em>
+        <strong>${heroTotalAssets} 条资产 · ${heroEntries} 篇文章</strong>
+        <em>${heroHelpful ? `读者标记有用 ${heroHelpful} 次` : '按最新沉淀排序'}</em>
       </div>
       <button type="button" class="ghost-btn" data-asset-open-all>全部资产</button>
     </div>
@@ -3592,7 +3972,10 @@ function renderHomeAssetActivityList(el) {
 
 async function openAssetActivityButton(btn) {
   if (!btn) return;
-  const entry = state.entries.find(item => item.id === btn.dataset.assetEntry);
+  const entry = state.entries.find(item => item.id === btn.dataset.assetEntry)
+    || (state.homeAssets && Array.isArray(state.homeAssets.entries)
+      ? state.homeAssets.entries.find(item => item.id === btn.dataset.assetEntry)
+      : null);
   if (!entry) return;
   const focus = btn.dataset.assetFocus;
   const itemId = btn.dataset.assetItemId || '';
@@ -3616,17 +3999,30 @@ function renderAssetActivityStrip() {
   if (state.view === 'assets') {
     const { entries, latest, counts, totalAssets } = assetDashboardStats();
     const total = entries.length;
+    // 服务端全量资产计数优先；搜索时用 /api/assets 返回的匹配集汇总窗口。
+    const live = state.assetCounts && !state.q ? state.assetCounts : null;
+    const listed = state.entryListSource === 'assets' ? state.assetListCounts : null;
     const allActiveEntries = state.assetFilter
       ? entries.filter(entry => entryHasAssetType(entry, state.assetFilter))
       : entries;
     const scopedEntries = state.q
       ? allActiveEntries.filter(entry => entryMatchesSearch(entry, { includeAssets: true }))
       : allActiveEntries;
-    const activeAssetCount = state.assetFilter ? assetTypeCount(scopedEntries, state.assetFilter) : assetTotalCount(scopedEntries);
-    const activeEntryCount = scopedEntries.length;
+    const countedAssetTotal = source => source
+      ? (state.assetFilter ? Number(source.byType?.[state.assetFilter]) || 0 : Number(source.totalAssets) || 0)
+      : null;
+    const activeAssetCount = countedAssetTotal(listed) ?? countedAssetTotal(live)
+      ?? (state.assetFilter ? assetTypeCount(scopedEntries, state.assetFilter) : assetTotalCount(scopedEntries));
+    // 列表来自 /api/assets 时，文章数用它的 total（含搜索与 assetFilter），与列表同源。
+    const activeEntryCount = state.entryListSource === 'assets' && Number(state.entryListTotal) > 0
+      ? Number(state.entryListTotal)
+      : live ? live.entries : scopedEntries.length;
+    const chipCounts = listed && listed.byType ? listed.byType : live && live.byType ? live.byType : counts;
+    const chipTotalAssets = listed ? Number(listed.totalAssets) || 0 : live ? Number(live.totalAssets) || 0 : totalAssets;
     const activeLabel = state.assetFilter ? `${assetDirectoryLabel(state.assetFilter)}资产` : '公开资产';
-    el.classList.toggle('hidden', !total && !state.assetFilter);
-    if (!total && !state.assetFilter) {
+    const hasAssets = Boolean(total || state.assetFilter || (live && live.totalAssets) || (listed && listed.totalAssets));
+    el.classList.toggle('hidden', !hasAssets);
+    if (!hasAssets) {
       el.innerHTML = '';
       return;
     }
@@ -3658,10 +4054,10 @@ function renderAssetActivityStrip() {
     `).join('');
     const chips = [
       `<button type="button" class="asset-filter-chip${!state.assetFilter ? ' active' : ''}" data-asset-strip-filter="" title="查看全部公开资产">
-        <span>全部</span><strong>${totalAssets}</strong>
+        <span>全部</span><strong>${chipTotalAssets}</strong>
       </button>`,
       ...Object.entries(ASSET_FILTERS).map(([type, def]) => {
-        const count = counts[type] || 0;
+        const count = chipCounts[type] || 0;
         return `<button type="button" class="asset-filter-chip asset-filter-${type}${state.assetFilter === type ? ' active' : ''}" data-asset-strip-filter="${escapeHtml(type)}" ${count ? '' : 'disabled'} title="${escapeHtml(count ? def.title : '暂无这类资产')}">
           <span>${escapeHtml(def.label)}</span><strong>${count}</strong>
         </button>`;
@@ -4084,7 +4480,7 @@ function updateEntryAssets(entryId, patch = {}, { rerenderList = true } = {}) {
   if (rerenderList) renderList();
 }
 
-function applyServerEntryUpdate(entry) {
+function applyServerEntryUpdate(entry, { rerenderList = true } = {}) {
   if (!entry || !entry.id) return null;
   const current = state.activeEntry && state.activeEntry.id === entry.id ? state.activeEntry : {};
   const updated = { ...current, ...entry };
@@ -4097,7 +4493,7 @@ function applyServerEntryUpdate(entry) {
     if (!shouldHoldOriginal(updated)) renderOriginalContent(updated, updated.content || contentCache.get(updated.id) || '');
     updateFetchOriginalButton(updated);
   }
-  renderList();
+  if (rerenderList) renderList();
   return updated;
 }
 
@@ -4537,7 +4933,7 @@ async function syncVisibleTitles() {
         for (const entry of state.entries) if (entry.id === item.id && entry.title === item.title && entry.titleZh !== item.titleZh) { entry.titleZh = item.titleZh; changed = true; }
         if (state.activeEntry?.id === item.id && state.activeEntry.title === item.title) { state.activeEntry.titleZh = item.titleZh; renderTitle(state.activeEntry); }
       }
-      if (changed) renderList();
+      if (changed) (result.titles || []).forEach(item => refreshEntryCardContent(item.id));
       if (!result.pending) break;
       await delay(2000);
       if (sequence !== titleSyncSequence) return;
@@ -4595,7 +4991,8 @@ function restoreEntryListPosition(list, position) {
       list.scrollTop = Math.max(0, cardOffset - anchor.offset);
     }
   }
-  cards.get(position.focusedId)?.focus({ preventScroll: true });
+  // 键盘导航后焦点必须落在当前文章上，否则描边留在上一次点过的卡片。
+  cards.get(selected ? position.selectedId : position.focusedId)?.focus({ preventScroll: true });
 }
 
 function renderList() {
@@ -4605,9 +5002,7 @@ function renderList() {
   renderListScopeBar();
   renderEntryPaneTabs();
   const scopeEntries = visibleEntries();
-  const unreadCount = scopeEntries.filter(entry => !state.read.has(entry.id)).length;
-  const scopeCount = state.view === 'unread' ? unreadCount : scopeEntries.length;
-  $('#list-scope-count').textContent = `${scopeCount} 篇 · ${unreadCount} 未读`;
+  updateListScopeCount(scopeEntries);
   $('#list-context-row').classList.toggle('hidden', state.view === 'contributors');
   $('#mark-read-btn').classList.toggle('hidden', state.view === 'contributors' || (isHomeScope() && state.homeTab === 'assets'));
   if (state.view === 'contributors') {
@@ -4741,6 +5136,7 @@ function renderList() {
   }
   if (visibleList.length < list.length) {
     const more = document.createElement('button');
+    // 这里只负责展开「已加载」的条目，所以剩余数也只算窗口内；全量缺口交给下面的加载更早。
     const remaining = list.length - visibleList.length;
     more.type = 'button';
     more.className = 'list-load-more';
@@ -4764,8 +5160,11 @@ function renderList() {
     earlier.type = 'button';
     earlier.className = 'list-load-more list-load-earlier';
     earlier.disabled = state.entriesLoadingMore;
-    earlier.textContent = state.entriesLoadingMore ? '正在加载…' : '加载更早文章';
-    earlier.setAttribute('aria-label', state.entriesLoadingMore ? '正在加载更早文章' : '加载更早文章');
+    // 未加载的部分用真值算，别让用户以为已经到底。
+    const unloaded = Math.max(0, (Number(state.entryListTotal) || 0) - list.length);
+    const earlierLabel = unloaded ? `加载更早文章 · 还有 ${unloaded} 篇` : '加载更早文章';
+    earlier.textContent = state.entriesLoadingMore ? '正在加载…' : earlierLabel;
+    earlier.setAttribute('aria-label', state.entriesLoadingMore ? '正在加载更早文章' : earlierLabel);
     earlier.onclick = () => { void loadMoreEntries(); };
     frag.appendChild(earlier);
   }
@@ -6481,7 +6880,7 @@ async function loadTranslation(entry) {
     renderTranslation(data.translation);
     if (data.translation && Array.isArray(data.translation.content) && data.translation.content.length) {
       updateEntryAssets(entry.id, entryAssetHelpfulPatch('translation', data.translation), { rerenderList: false });
-      renderList();
+      refreshEntryCardBadges(entry.id);
     }
   } catch {
     if (current()) renderTranslation(null, { error: true });
@@ -6655,7 +7054,7 @@ async function loadRewrite(entry, { poll = false, startedAt = Date.now(), readin
       // Readiness is retained even when the original list used a compact payload.
       state.activeEntry = { ...state.activeEntry, rewriteReady: true, rewriteStatus: 'ready' };
       updateEntryAssets(entry.id, entryAssetHelpfulPatch('rewrite', data.rewrite), { rerenderList: false });
-      renderList();
+      refreshEntryCardBadges(entry.id);
     } else if (!assetId && ['queued', 'processing', 'retrying', 'not_ready'].includes(status) && data.retryAfterMs > 0) {
       const delay = Math.min(15000, Math.max(3000, Number(data.retryAfterMs) || 5000));
       state.rewritePollTimer = setTimeout(() => {
@@ -6744,7 +7143,7 @@ async function generateTranslation({ force = false } = {}) {
     renderTranslation(data.translation);
     if (data.translation && Array.isArray(data.translation.content) && data.translation.content.length) {
       updateEntryAssets(entry.id, entryAssetHelpfulPatch('translation', data.translation), { rerenderList: false });
-      renderList();
+      refreshEntryCardBadges(entry.id);
     }
     toast(data.originalFetched ? '已获取原文并保存双语翻译' : data.cached ? '已显示缓存翻译' : '双语翻译已保存');
   } catch (err) {
@@ -6795,7 +7194,7 @@ async function generateRewrite({ force = false } = {}) {
     renderRewrite(data.rewrite);
     if (data.rewrite && data.rewrite.body) {
       updateEntryAssets(entry.id, entryAssetHelpfulPatch('rewrite', data.rewrite), { rerenderList: false });
-      renderList();
+      refreshEntryCardBadges(entry.id);
     }
     const copyTextForEntry = rewriteUiCopy(state.activeEntry || entry);
     toast(data.originalFetched ? copyTextForEntry.fetched : data.cached ? copyTextForEntry.cached : copyTextForEntry.saved);
@@ -7503,7 +7902,7 @@ async function loadAnnotations(entry) {
     state.annotations = data.annotations || [];
     updateEntryAssets(entry.id, annotationAssetPatch(state.annotations), { rerenderList: false });
     renderAnnotations();
-    renderList();
+    refreshEntryCardBadges(entry.id);
   } catch {
     renderAnnotations();
   }
@@ -8723,7 +9122,7 @@ async function loadComments(entry) {
     const data = await api(`/api/entry/${entry.id}/comments`);
     if (state.activeEntry?.id !== entry.id) return;
     state.comments = data.comments || [];
-    updateEntryAssets(entry.id, { comments: state.comments.length });
+    updateEntryAssets(entry.id, { comments: state.comments.length }, { rerenderList: false });
     renderComments();
   } catch {
     renderComments();
@@ -9038,7 +9437,7 @@ async function loadAgentMessages(entry) {
     const data = await api(`/api/entry/${entry.id}/chat`);
     if (state.activeEntry?.id !== entry.id) return;
     state.agentMessages = data.messages || [];
-    updateEntryAssets(entry.id, { chatMessages: state.agentMessages.length });
+    updateEntryAssets(entry.id, { chatMessages: state.agentMessages.length }, { rerenderList: false });
     renderAgent();
   } catch {
     renderAgent();
@@ -9121,7 +9520,7 @@ function loadEntryExtrasAfterReading(entry, readingTask, openId) {
     // Writes can wait on SQLite while a refresh worker holds its writer lock.
     // Do not let those writes or supplementary reads delay delivery of the body.
     recordEntryView(entry.id);
-    syncEntryState(entry.id, { read: true, viewed: true });
+    syncEntryState(entry.id, { read: true, viewed: true }, { rerenderList: false });
     loadTranslation(entry);
     loadAnnotations(entry);
     loadComments(entry);
@@ -9153,7 +9552,12 @@ async function openEntry(e, { tab = null, focus = null, aiAssetId = '', commentI
     : requestedFocus === 'rewrite'
       ? 'rewrite'
       : initialReaderTab(e, tab);
+  const wasUnread = !state.read.has(e.id);
   state.read.add(e.id);
+  if (wasUnread) {
+    adjustUnreadCounts(e.sourceId);
+    scheduleCountRefresh();
+  }
   persist();
 
   const src = sourceById(e.sourceId);
@@ -9258,7 +9662,7 @@ async function openEntry(e, { tab = null, focus = null, aiAssetId = '', commentI
   applyReaderPrefs();
   renderAgent();
 
-  renderEntryStateUi();
+  refreshEntryReadState(e.id);
 
   // content is loaded lazily — the list API omits it to stay lightweight
   let content = e.content || contentCache.get(e.id);
@@ -10691,6 +11095,7 @@ $('#entry-pane-tabs').onclick = (e) => {
   if (!btn) return;
   state.homeTab = btn.dataset.homeTab === 'assets' ? 'assets' : 'entries';
   storage.setItem('qm_home_tab', state.homeTab);
+  if (state.homeTab === 'assets' && !state.homeAssets) void refreshHomeAssets();
   renderList();
 };
 $('#list-scope-bar').onclick = (e) => {
@@ -10762,8 +11167,8 @@ $('#reader-star').onclick = () => {
   const nextStarred = !state.starred.has(e.id);
   nextStarred ? state.starred.add(e.id) : state.starred.delete(e.id);
   persist();
-  renderEntryStateUi();
-  syncEntryState(e.id, { starred: nextStarred });
+  refreshEntryStarState(e.id);
+  syncEntryState(e.id, { starred: nextStarred }, { rerenderList: false });
 };
 async function setReaderReaction(reaction) {
   const entry = state.activeEntry;
@@ -11579,7 +11984,8 @@ document.addEventListener('keydown', (e) => {
       return;
     }
     if (window.QMAiSettings && QMAiSettings.hasDialog()) { QMAiSettings.closeDialog(); return; }
-    if (state.readerImmersive) setReaderImmersive(false);
+    if (state.readerImmersive) { setReaderImmersive(false); return; }
+    const workspaceOpen = Boolean(state.workspacePage);
     setReaderPrefsOpen(false);
     document.getElementById('app').classList.remove('reading');
     setAccountMenuOpen(false);
@@ -11592,6 +11998,10 @@ document.addEventListener('keydown', (e) => {
     if (state.workspacePage === 'dashboard') closeMyCommentsModal();
     else if (state.workspacePage === 'contributor') closeContributorModal();
     else if (state.workspacePage === 'admin') closeAdminPage();
+    if (!workspaceOpen && state.activeEntry) {
+      closeReaderFromRoute();
+      clearReaderUrl({ replace: true });
+    }
     return;
   }
   if (editable || e.metaKey || e.ctrlKey) return;

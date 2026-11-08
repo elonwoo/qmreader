@@ -218,7 +218,8 @@
       state.page = pageNumber;
       state.hasNext = Boolean(data.pagination?.has_next);
       $('ps-more').classList.toggle('hidden', !state.hasNext);
-      $('ps-count').textContent = `${$('ps-episodes').querySelectorAll('.ps-result').length} 集`;
+      const episodeCount = $('ps-episodes').querySelectorAll('.ps-result').length;
+      $('ps-count').textContent = state.hasNext ? `已加载 ${episodeCount} 集` : `共 ${episodeCount} 集`;
       $('ps-empty').classList.toggle('hidden', Boolean($('ps-episodes').querySelector('.ps-result')));
       if (!episodes.length && pageNumber === 1) $('ps-empty').textContent = '这档节目目前没有可打开的单集文稿。';
       status();

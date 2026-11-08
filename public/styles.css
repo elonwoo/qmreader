@@ -159,8 +159,9 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
   --entry-width: minmax(292px, 340px);
   --agent-width: 304px;
   --context-resizer-width: 6px;
+  --list-resizer-width: 6px;
   display: grid;
-  grid-template-columns: var(--sidebar-width) var(--entry-width) 6px minmax(460px, 1fr) var(--context-resizer-width) var(--agent-width);
+  grid-template-columns: var(--sidebar-width) var(--entry-width) var(--list-resizer-width) minmax(460px, 1fr) var(--context-resizer-width) var(--agent-width);
   height: 100vh;
   height: 100dvh;
   min-height: 0;
@@ -4675,7 +4676,8 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 
 #app {
   --context-resizer-width: 4px;
-  grid-template-columns: var(--sidebar-width) var(--entry-width) 4px minmax(500px, 1fr) var(--context-resizer-width) var(--agent-width);
+  --list-resizer-width: 4px;
+  grid-template-columns: var(--sidebar-width) var(--entry-width) var(--list-resizer-width) minmax(500px, 1fr) var(--context-resizer-width) var(--agent-width);
   background: var(--bg-0);
 }
 #sidebar,
@@ -6627,7 +6629,8 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
     --sidebar-width: 188px;
     --entry-width: minmax(238px, 280px);
     --agent-width: 230px;
-    grid-template-columns: var(--sidebar-width) var(--entry-width) 6px minmax(330px, 1fr) var(--context-resizer-width) var(--agent-width);
+    --list-resizer-width: 6px;
+    grid-template-columns: var(--sidebar-width) var(--entry-width) var(--list-resizer-width) minmax(330px, 1fr) var(--context-resizer-width) var(--agent-width);
   }
   .source-refresh-status { display: none; }
 }
@@ -6636,7 +6639,8 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
     --sidebar-width: 232px;
     --entry-width: minmax(288px, 340px);
     --agent-width: 280px;
-    grid-template-columns: var(--sidebar-width) var(--entry-width) 6px minmax(360px, 1fr) var(--context-resizer-width) var(--agent-width);
+    --list-resizer-width: 6px;
+    grid-template-columns: var(--sidebar-width) var(--entry-width) var(--list-resizer-width) minmax(360px, 1fr) var(--context-resizer-width) var(--agent-width);
   }
   .source-refresh-status { display: none; }
 }
@@ -8719,18 +8723,25 @@ button:disabled { cursor: not-allowed; opacity: 0.62; }
 /* Explicit desktop reader expansion must beat compact reading breakpoints. */
 @media (min-width: 981px) {
   #app.reading:not(.left-collapsed):not(.reader-immersive) {
-    --entry-width: minmax(260px, 320px);
+    /* Keep in sync with the workbench baseline (workbench.css): opening or
+       closing an article must not shift any pane. */
+    --entry-width: minmax(296px, 320px);
     grid-template-columns:
       var(--sidebar-width)
       var(--entry-width)
-      4px
+      var(--list-resizer-width)
       minmax(0, 1fr)
       var(--context-resizer-width)
       var(--agent-width) !important;
   }
 
-  #app.reading:not(.sidebar-collapsed):not(.left-collapsed):not(.reader-immersive) {
-    --sidebar-width: 232px;
+  #app.reading:not(.left-collapsed):not(.reader-immersive):not(.sidebar-collapsed) {
+    --sidebar-width: 220px;
+  }
+
+  #app.reading:not(.left-collapsed):not(.reader-immersive):not(.agent-collapsed) {
+    --agent-width: 340px;
+    --context-resizer-width: 6px;
   }
 
   #app.reading:not(.left-collapsed):not(.reader-immersive) #sidebar {

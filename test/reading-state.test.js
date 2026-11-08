@@ -42,7 +42,7 @@ function reader() {
     entryRewriteStatus: () => 'ready', isAdmin: () => false,
     updateRewriteUiLabels() {}, renderReaderStatsUi() {}, renderAssetHelpfulButton() {},
     updateReaderLanguageProfile() {}, applyTextAnnotations() {}, renderReaderAssetSummary() {}, settlePendingAssetJump() {},
-    updateEntryAssets() {}, entryAssetHelpfulPatch: () => ({}), renderList() {},
+    updateEntryAssets() {}, entryAssetHelpfulPatch: () => ({}), renderList() {}, refreshEntryCardBadges() {},
     pauseReaderMedia() {}, mountReaderMedia() {}, sanitize: html => html,
     renderMarkdownLite: text => `<p>${text}</p>`, rewriteMetaText: () => '',
     maybeGenerateRewriteAfterLoad() {}, setReaderTab: tab => { state.readerTab = tab; },
@@ -196,12 +196,16 @@ test('a transient startup list error retries once without reloading the page', a
   let attempts = 0;
   const sandbox = {
     state: { view: 'all', optInSources: new Set() },
+    isHomeScope: () => false,
     ENTRY_LIST_PAGE_SIZE: 40,
     ENTRY_RENDER_BATCH_SIZE: 20,
     URLSearchParams, AbortController,
     document: { getElementById: () => null },
     setTimeout: callback => callback(),
-    api: async () => {
+    api: async url => {
+      if (String(url).startsWith('/api/counts') || String(url).startsWith('/api/asset-counts')) {
+        return { all: 0, unread: 0, hot: 0, bySource: {}, bySourceAll: {}, totalAssets: 0, entries: 0, helpfulTotal: 0, byType: {} };
+      }
       if (++attempts === 1) throw Object.assign(new Error('Unavailable'), { status: 503 });
       return { entries: [entry] };
     },
