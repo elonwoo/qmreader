@@ -1640,3 +1640,23 @@ html { scrollbar-width: thin; scrollbar-color: var(--wb-thumb) transparent; }
 .reading-asset-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 @keyframes reading-asset-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .reading-asset-spinner { animation: none; } }
+
+/* 列表卡片不响应鼠标悬停：鼠标停在卡片上不该改背景或位移，避免干扰阅读位置判断。 */
+#app .entry-card:hover,
+#app #entry-pane .entry-card:hover,
+[data-theme="dark"] #app .entry-card:hover,
+[data-theme="dark"] #app #entry-pane .entry-card:hover {
+  background: transparent;
+  transform: none;
+}
+#app #entry-pane .entry-card.active:hover { background: var(--bg-2); }
+
+/* 去掉列表卡片的键盘焦点描边：当前文章已有选中底色，描边只是噪音。 */
+#app .entry-card:focus-visible,
+#app #entry-pane .entry-card:focus-visible {
+  outline: none;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+#app #entry-pane .entry-card.active:focus-visible { background: var(--bg-2); }
